@@ -1190,15 +1190,28 @@ class Scheduler(SchedulerInterface):
         
         import json
         import os
+        from datetime import datetime
         
-        # Create output directory
-        output_dir = "decode_timings"
+        # Get output directory from environment variable or use default
+        # Set VLLM_DECODE_TIMINGS_DIR to match your benchmark log location
+        output_dir = os.environ.get(
+            "VLLM_DECODE_TIMINGS_DIR", 
+            os.path.join(os.getcwd(), "decode_timings")
+        )
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert arrival_time (Unix timestamp in seconds) to human-readable format
+        arrival_time_unix = request.arrival_time
+        arrival_time_str = datetime.fromtimestamp(arrival_time_unix).strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )
         
         # Prepare data
         timings_data = {
             "request_id": request.request_id,
-            "arrival_time": request.arrival_time,
+            "arrival_time_unix": arrival_time_unix,
+            "arrival_time_str": arrival_time_str,
+            "arrival_time_ms": arrival_time_unix * 1000.0,
             "first_token_timestamp_ms": request.first_token_timestamp,
             "num_prompt_tokens": request.num_prompt_tokens,
             "num_output_tokens": len(request.output_token_ids),
@@ -1207,6 +1220,7 @@ class Scheduler(SchedulerInterface):
                     "token_id": token_id,
                     "timestamp_ms": timestamp_ms,
                     "output_token_index": token_idx,
+                    "time_since_arrival_ms": timestamp_ms - arrival_time_unix * 1000.0,
                 }
                 for token_id, timestamp_ms, token_idx in request.decode_step_timings
             ]
@@ -1224,8 +1238,11 @@ class Scheduler(SchedulerInterface):
                 for i in range(1, len(timings))
             ]
             
+            total_time_ms = timings[-1] - arrival_time_unix * 1000.0
+            
             timings_data["statistics"] = {
                 "time_to_first_token_ms": time_to_first_token_ms,
+                "total_generation_time_ms": total_time_ms,
                 "inter_token_latencies_ms": inter_token_latencies,
                 "avg_inter_token_latency_ms": (
                     sum(inter_token_latencies) / len(inter_token_latencies)
@@ -1236,6 +1253,10 @@ class Scheduler(SchedulerInterface):
                 ),
                 "max_inter_token_latency_ms": (
                     max(inter_token_latencies) if inter_token_latencies else None
+                ),
+                "throughput_tokens_per_sec": (
+                    len(request.output_token_ids) / (total_time_ms / 1000.0)
+                    if total_time_ms > 0 else None
                 ),
             }
         
