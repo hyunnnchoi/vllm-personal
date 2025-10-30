@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -622,6 +623,24 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+        # NOTE(hyunnnchoi,2025-10-30): Log batch scheduling details for debugging
+        if logger.isEnabledFor(logging.INFO):
+            scheduled_req_ids = (
+                [r.request_id for r in scheduled_new_reqs] +
+                [r.request_id for r in scheduled_running_reqs] +
+                [r.request_id for r in scheduled_resumed_reqs]
+            )
+            logger.info(
+                f"Scheduled batch: "
+                f"new_reqs={len(scheduled_new_reqs)} {[r.request_id for r in scheduled_new_reqs]}, "
+                f"running_reqs={len(scheduled_running_reqs)} {[r.request_id for r in scheduled_running_reqs]}, "
+                f"resumed_reqs={len(scheduled_resumed_reqs)} {[r.request_id for r in scheduled_resumed_reqs]}, "
+                f"total_reqs={len(scheduled_req_ids)}, "
+                f"total_tokens={total_num_scheduled_tokens}, "
+                f"waiting_reqs={len(self.waiting)}, "
+                f"preempted_reqs={len(preempted_reqs)}"
+            )
 
         self._update_after_schedule(scheduler_output)
         return scheduler_output
