@@ -905,6 +905,23 @@ async def main_mp(
             new_data = result_queue.get()
             client_metrics.append(new_data)
             debug_stats.update(new_data)
+            
+            # NOTE(hyunnnchoi,2025-10-30): 개별 request 메트릭 상세 출력
+            logger.info("-" * 50)
+            logger.info(
+                f"{Color.GREEN}[Request #{len(client_metrics)}] "
+                f"conv_id={new_data.conversation_id}, client_id={new_data.client_id}{Color.RESET}"
+            )
+            logger.info(f"  ttft_ms           : {new_data.ttft_ms:.3f}")
+            logger.info(f"  tpot_ms           : {new_data.tpot_ms:.3f}")
+            logger.info(f"  latency_ms        : {new_data.latency_ms:.3f}")
+            logger.info(f"  input_num_turns   : {new_data.input_num_turns}")
+            logger.info(f"  input_num_tokens  : {new_data.input_num_tokens}")
+            logger.info(f"  output_num_tokens : {new_data.output_num_tokens}")
+            logger.info(f"  output_num_chunks : {new_data.output_num_chunks}")
+            logger.info(f"  output_first_chunk: {new_data.output_num_first_chunk_tokens} tokens")
+            logger.info(f"  approx_cached_%   : {new_data.approx_cached_percent:.2f}%")
+            logger.info("-" * 50)
 
         if conv_id is TERM_SIGNAL:
             num_clients_finished += 1
@@ -927,9 +944,7 @@ async def main_mp(
             percent = finished_convs / total_convs
 
             # Tuned to control the print rate (can be changed if required)
-            # print_cycle = max(3, int(bench_args.num_clients / 4))
-            # NOTE(hyunnnchoi, 2025-10-30): 단일 request 별 출력 볼 수 있도록 변경함. 
-            print_cycle = 1
+            print_cycle = max(3, int(bench_args.num_clients / 4))
             if finished_convs % print_cycle == 0:
                 runtime_sec = nanosec_to_sec(time.perf_counter_ns() - start_time)
                 logger.info(
