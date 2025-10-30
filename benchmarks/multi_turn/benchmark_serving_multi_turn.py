@@ -927,8 +927,9 @@ async def main_mp(
             percent = finished_convs / total_convs
 
             # Tuned to control the print rate (can be changed if required)
-            print_cycle = max(3, int(bench_args.num_clients / 4))
-
+            # print_cycle = max(3, int(bench_args.num_clients / 4))
+            # NOTE(hyunnnchoi, 2025-10-30): 단일 request 별 출력 볼 수 있도록 변경함. 
+            print_cycle = 1
             if finished_convs % print_cycle == 0:
                 runtime_sec = nanosec_to_sec(time.perf_counter_ns() - start_time)
                 logger.info(
