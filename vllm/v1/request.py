@@ -122,6 +122,11 @@ class Request:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
 
+        # NOTE(hyunnnchoi,2025-10-30): Track decode step timings for debugging
+        # Each entry: (token_id, timestamp_ms, num_output_tokens_so_far)
+        self.decode_step_timings: list[tuple[int, float, int]] = []
+        self.first_token_timestamp: Optional[float] = None
+
     @classmethod
     def from_engine_core_request(
         cls, request: EngineCoreRequest,

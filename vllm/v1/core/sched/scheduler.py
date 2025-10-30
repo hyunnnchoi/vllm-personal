@@ -882,6 +882,9 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # NOTE(hyunnnchoi,2025-10-30): Record iteration timestamp for decode step timing
+        iteration_timestamp_ms = time.time() * 1000.0
+        
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -940,6 +943,16 @@ class Scheduler(SchedulerInterface):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids)
+                
+                # NOTE(hyunnnchoi,2025-10-30): Record decode step timing for each token
+                for token_id in new_token_ids:
+                    num_output_tokens = len(request.output_token_ids)
+                    request.decode_step_timings.append(
+                        (token_id, iteration_timestamp_ms, num_output_tokens)
+                    )
+                    # Record first token timestamp
+                    if request.first_token_timestamp is None:
+                        request.first_token_timestamp = iteration_timestamp_ms
 
             # Stop checking for pooler models.
             pooler_output = None
@@ -949,6 +962,9 @@ class Scheduler(SchedulerInterface):
                                      pooler_output)
 
             if stopped:
+                # NOTE(hyunnnchoi,2025-10-30): Save decode step timings to file
+                self._save_decode_timings(request)
+                
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1162,6 +1178,79 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             request.status = finished_status
             self._free_request(request)
+
+    def _save_decode_timings(self, request: Request) -> None:
+        """Save decode step timings to a JSON file for analysis.
+        
+        NOTE(hyunnnchoi,2025-10-30): This saves detailed per-token timing
+        information for debugging and performance analysis.
+        """
+        if not request.decode_step_timings:
+            return
+        
+        import json
+        import os
+        
+        # Create output directory
+        output_dir = "decode_timings"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Prepare data
+        timings_data = {
+            "request_id": request.request_id,
+            "arrival_time": request.arrival_time,
+            "first_token_timestamp_ms": request.first_token_timestamp,
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_output_tokens": len(request.output_token_ids),
+            "decode_steps": [
+                {
+                    "token_id": token_id,
+                    "timestamp_ms": timestamp_ms,
+                    "output_token_index": token_idx,
+                }
+                for token_id, timestamp_ms, token_idx in request.decode_step_timings
+            ]
+        }
+        
+        # Calculate statistics
+        if len(request.decode_step_timings) > 1:
+            timings = [t[1] for t in request.decode_step_timings]
+            time_to_first_token_ms = (
+                request.first_token_timestamp - request.arrival_time * 1000.0
+                if request.first_token_timestamp else None
+            )
+            inter_token_latencies = [
+                timings[i] - timings[i-1] 
+                for i in range(1, len(timings))
+            ]
+            
+            timings_data["statistics"] = {
+                "time_to_first_token_ms": time_to_first_token_ms,
+                "inter_token_latencies_ms": inter_token_latencies,
+                "avg_inter_token_latency_ms": (
+                    sum(inter_token_latencies) / len(inter_token_latencies)
+                    if inter_token_latencies else None
+                ),
+                "min_inter_token_latency_ms": (
+                    min(inter_token_latencies) if inter_token_latencies else None
+                ),
+                "max_inter_token_latency_ms": (
+                    max(inter_token_latencies) if inter_token_latencies else None
+                ),
+            }
+        
+        # Save to file
+        filename = os.path.join(
+            output_dir, 
+            f"decode_timing_{request.request_id}.json"
+        )
+        with open(filename, "w") as f:
+            json.dump(timings_data, f, indent=2)
+        
+        logger.info(
+            f"Saved decode timings for request {request.request_id} "
+            f"({len(request.decode_step_timings)} tokens) to {filename}"
+        )
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
