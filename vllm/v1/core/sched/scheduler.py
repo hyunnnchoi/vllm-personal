@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import csv
 import itertools
 import logging
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -176,6 +178,53 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+        # CSV logging setup
+        # 환경변수로 지정하거나, 기본 경로 사용
+        csv_log_enabled = os.environ.get("VLLM_SCHEDULER_CSV_LOG", "0") == "1"
+        self.csv_log_dir = os.environ.get(
+            "VLLM_SCHEDULER_CSV_LOG_DIR",
+            "/tmp/vllm_scheduler_logs" if csv_log_enabled else None
+        )
+        self.batch_csv_file = None
+        self.request_csv_file = None
+        self.batch_csv_writer = None
+        self.request_csv_writer = None
+        self.iteration_counter = 0
+        
+        if self.csv_log_dir:
+            os.makedirs(self.csv_log_dir, exist_ok=True)
+            
+            # Batch log CSV - iteration마다 한 행
+            batch_csv_path = os.path.join(
+                self.csv_log_dir, 
+                f"batch_log_dp{self.parallel_config.data_parallel_rank}.csv"
+            )
+            self.batch_csv_file = open(batch_csv_path, 'w', newline='')
+            self.batch_csv_writer = csv.writer(self.batch_csv_file)
+            self.batch_csv_writer.writerow([
+                'iteration', 'timestamp', 'iteration_time_ms',
+                'new_reqs', 'running_reqs', 'resumed_reqs', 'total_reqs',
+                'total_tokens', 'waiting_reqs', 'preempted_reqs',
+                'prefill_reqs', 'decode_reqs', 'prefill_ratio'
+            ])
+            self.batch_csv_file.flush()
+            
+            # Request log CSV - iteration마다 각 request별로 한 행씩
+            request_csv_path = os.path.join(
+                self.csv_log_dir,
+                f"request_log_dp{self.parallel_config.data_parallel_rank}.csv"
+            )
+            self.request_csv_file = open(request_csv_path, 'w', newline='')
+            self.request_csv_writer = csv.writer(self.request_csv_file)
+            self.request_csv_writer.writerow([
+                'iteration', 'timestamp', 'request_id', 'phase',
+                'num_prompt_tokens', 'num_output_tokens', 'num_computed_tokens',
+                'chunk_start', 'chunk_end', 'num_scheduled_tokens'
+            ])
+            self.request_csv_file.flush()
+            
+            logger.info(f"CSV logging enabled. Logs will be saved to {self.csv_log_dir}")
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -626,21 +675,161 @@ class Scheduler(SchedulerInterface):
 
         # NOTE(hyunnnchoi,2025-10-30): Log batch scheduling details for debugging
         if logger.isEnabledFor(logging.INFO):
+            # 1. Iteration 시간 계산
+            iteration_time_ms = (time.monotonic() - scheduled_timestamp) * 1000
+            
             scheduled_req_ids = (
                 [r.request_id for r in scheduled_new_reqs] +
                 [r.request_id for r in scheduled_running_reqs] +
                 [r.request_id for r in scheduled_resumed_reqs]
             )
+            
+            # 2. Running request들의 토큰 인덱스 정보
+            all_scheduled_reqs = scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
+            running_req_token_info = {}
+            prefill_count = 0
+            decode_count = 0
+            
+            for req in all_scheduled_reqs:
+                is_prefill = req.num_computed_tokens < req.num_prompt_tokens
+                if is_prefill:
+                    prefill_count += 1
+                else:
+                    decode_count += 1
+                
+                # Chunked prefill 정보
+                if is_prefill and req.num_computed_tokens > 0:
+                    # Chunked prefill 중
+                    chunk_start = req.num_computed_tokens
+                    chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                    running_req_token_info[req.request_id] = {
+                        'computed': req.num_computed_tokens,
+                        'input_tokens': req.num_prompt_tokens,
+                        'output_tokens': req.num_output_tokens,
+                        'phase': f'prefill_chunk[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]'
+                    }
+                elif is_prefill:
+                    # 첫 prefill
+                    chunk_end = num_scheduled_tokens.get(req.request_id, 0)
+                    running_req_token_info[req.request_id] = {
+                        'computed': req.num_computed_tokens,
+                        'input_tokens': req.num_prompt_tokens,
+                        'output_tokens': req.num_output_tokens,
+                        'phase': f'prefill_first[0:{chunk_end}/{req.num_prompt_tokens}]'
+                    }
+                else:
+                    # Decode phase
+                    running_req_token_info[req.request_id] = {
+                        'computed': req.num_computed_tokens,
+                        'input_tokens': req.num_prompt_tokens,
+                        'output_tokens': req.num_output_tokens,
+                        'phase': f'decode[token_{req.num_output_tokens + 1}]'
+                    }
+            
+            # 3. 새로 들어온 request의 input token 정보
+            new_req_info = [(r.request_id, r.num_prompt_tokens) for r in scheduled_new_reqs]
+            
+            # 4. Prefill/decode 비율
+            total_phase_reqs = prefill_count + decode_count
+            prefill_ratio = (prefill_count / total_phase_reqs * 100) if total_phase_reqs > 0 else 0
+            
+            # 5. Preempted request 상세 정보
+            preempted_req_ids = [r.request_id for r in preempted_reqs]
+            
+            # 상세 로그 출력
             logger.info(
-                f"Scheduled batch: "
+                f"Scheduled batch [iter_time={iteration_time_ms:.2f}ms]: "
                 f"new_reqs={len(scheduled_new_reqs)} {[r.request_id for r in scheduled_new_reqs]}, "
                 f"running_reqs={len(scheduled_running_reqs)} {[r.request_id for r in scheduled_running_reqs]}, "
                 f"resumed_reqs={len(scheduled_resumed_reqs)} {[r.request_id for r in scheduled_resumed_reqs]}, "
                 f"total_reqs={len(scheduled_req_ids)}, "
                 f"total_tokens={total_num_scheduled_tokens}, "
                 f"waiting_reqs={len(self.waiting)}, "
-                f"preempted_reqs={len(preempted_reqs)}"
+                f"preempted_reqs={len(preempted_reqs)} {preempted_req_ids}, "
+                f"prefill_reqs={prefill_count}, "
+                f"decode_reqs={decode_count}, "
+                f"prefill_ratio={prefill_ratio:.1f}%"
             )
+            
+            # 새 request input token 정보
+            if new_req_info:
+                logger.info(f"  New requests input tokens: {new_req_info}")
+            
+            # 각 request의 상세 정보
+            if running_req_token_info:
+                logger.info(f"  Request details:")
+                for req_id, info in running_req_token_info.items():
+                    logger.info(
+                        f"    {req_id}: {info['phase']}, "
+                        f"input={info['input_tokens']}, "
+                        f"output={info['output_tokens']}, "
+                        f"computed={info['computed']}"
+                    )
+            
+            # CSV 로깅 (환경변수로 활성화된 경우)
+            if self.csv_log_dir and self.batch_csv_writer and self.request_csv_writer:
+                current_timestamp = time.time()
+                
+                # Batch log - iteration당 한 행
+                self.batch_csv_writer.writerow([
+                    self.iteration_counter,
+                    current_timestamp,
+                    f"{iteration_time_ms:.2f}",
+                    len(scheduled_new_reqs),
+                    len(scheduled_running_reqs),
+                    len(scheduled_resumed_reqs),
+                    len(scheduled_req_ids),
+                    total_num_scheduled_tokens,
+                    len(self.waiting),
+                    len(preempted_reqs),
+                    prefill_count,
+                    decode_count,
+                    f"{prefill_ratio:.1f}"
+                ])
+                self.batch_csv_file.flush()
+                
+                # Request log - 각 request별로 한 행씩
+                for req in all_scheduled_reqs:
+                    info = running_req_token_info[req.request_id]
+                    
+                    # chunk_start, chunk_end 추출
+                    is_prefill = req.num_computed_tokens < req.num_prompt_tokens
+                    if is_prefill and req.num_computed_tokens > 0:
+                        # Chunked prefill
+                        chunk_start = req.num_computed_tokens
+                        chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                    elif is_prefill:
+                        # First prefill
+                        chunk_start = 0
+                        chunk_end = num_scheduled_tokens.get(req.request_id, 0)
+                    else:
+                        # Decode
+                        chunk_start = -1
+                        chunk_end = -1
+                    
+                    # phase는 prefill/decode/prefill_chunk 중 하나
+                    if is_prefill and req.num_computed_tokens > 0:
+                        phase = "prefill_chunk"
+                    elif is_prefill:
+                        phase = "prefill_first"
+                    else:
+                        phase = "decode"
+                    
+                    self.request_csv_writer.writerow([
+                        self.iteration_counter,
+                        current_timestamp,
+                        req.request_id,
+                        phase,
+                        info['input_tokens'],
+                        info['output_tokens'],
+                        info['computed'],
+                        chunk_start,
+                        chunk_end,
+                        num_scheduled_tokens.get(req.request_id, 0)
+                    ])
+                self.request_csv_file.flush()
+                
+                self.iteration_counter += 1
 
         self._update_after_schedule(scheduler_output)
         return scheduler_output
