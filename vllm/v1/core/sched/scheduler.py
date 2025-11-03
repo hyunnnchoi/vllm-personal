@@ -749,9 +749,22 @@ class Scheduler(SchedulerInterface):
                 else:
                     decode_count += 1
                 
-                # Chunked prefill 정보
-                if is_prefill and req.num_computed_tokens > 0:
-                    # Chunked prefill 중
+                # Prefill phase 분류
+                # scheduled_new_reqs에 포함된 request는 첫 번째 스케줄링
+                is_first_prefill = req in scheduled_new_reqs and is_prefill
+                
+                if is_prefill and is_first_prefill and req.num_computed_tokens > 0:
+                    # 첫 prefill이지만 prefix cache로 인해 일부 토큰이 이미 계산됨
+                    chunk_start = req.num_computed_tokens
+                    chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                    running_req_token_info[req.request_id] = {
+                        'computed': req.num_computed_tokens,
+                        'input_tokens': req.num_prompt_tokens,
+                        'output_tokens': req.num_output_tokens,
+                        'phase': f'prefill_first_cached[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]'
+                    }
+                elif is_prefill and req.num_computed_tokens > 0:
+                    # Chunked prefill 중 (이미 처리 중인 request)
                     chunk_start = req.num_computed_tokens
                     chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
                     running_req_token_info[req.request_id] = {
@@ -761,7 +774,7 @@ class Scheduler(SchedulerInterface):
                         'phase': f'prefill_chunk[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]'
                     }
                 elif is_prefill:
-                    # 첫 prefill
+                    # 첫 prefill (prefix cache 없음)
                     chunk_end = num_scheduled_tokens.get(req.request_id, 0)
                     running_req_token_info[req.request_id] = {
                         'computed': req.num_computed_tokens,
@@ -850,12 +863,18 @@ class Scheduler(SchedulerInterface):
                     
                     # chunk_start, chunk_end 추출
                     is_prefill = req.num_computed_tokens < req.num_prompt_tokens
-                    if is_prefill and req.num_computed_tokens > 0:
+                    is_first_prefill = req in scheduled_new_reqs and is_prefill
+                    
+                    if is_prefill and is_first_prefill and req.num_computed_tokens > 0:
+                        # 첫 prefill이지만 prefix cache로 인해 일부 토큰이 이미 계산됨
+                        chunk_start = req.num_computed_tokens
+                        chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                    elif is_prefill and req.num_computed_tokens > 0:
                         # Chunked prefill
                         chunk_start = req.num_computed_tokens
                         chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
                     elif is_prefill:
-                        # First prefill
+                        # First prefill (prefix cache 없음)
                         chunk_start = 0
                         chunk_end = num_scheduled_tokens.get(req.request_id, 0)
                     else:
@@ -863,8 +882,10 @@ class Scheduler(SchedulerInterface):
                         chunk_start = -1
                         chunk_end = -1
                     
-                    # phase는 prefill/decode/prefill_chunk 중 하나
-                    if is_prefill and req.num_computed_tokens > 0:
+                    # phase는 prefill_first/prefill_first_cached/prefill_chunk/decode 중 하나
+                    if is_prefill and is_first_prefill and req.num_computed_tokens > 0:
+                        phase = "prefill_first_cached"
+                    elif is_prefill and req.num_computed_tokens > 0:
                         phase = "prefill_chunk"
                     elif is_prefill:
                         phase = "prefill_first"
