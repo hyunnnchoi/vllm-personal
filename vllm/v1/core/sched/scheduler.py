@@ -191,40 +191,92 @@ class Scheduler(SchedulerInterface):
         self.batch_csv_writer = None
         self.request_csv_writer = None
         self.iteration_counter = 0
+        self.csv_rows_written = 0  # Track rows written to current file
+        self.csv_max_rows = int(os.environ.get("VLLM_SCHEDULER_CSV_MAX_ROWS", "1000000"))  # Default 1M rows per file
+        self.csv_file_counter = 0  # Counter for file rotation
         
         if self.csv_log_dir:
             os.makedirs(self.csv_log_dir, exist_ok=True)
-            
-            # Batch log CSV - iteration마다 한 행
-            batch_csv_path = os.path.join(
-                self.csv_log_dir, 
-                f"batch_log_dp{self.parallel_config.data_parallel_rank}.csv"
-            )
-            self.batch_csv_file = open(batch_csv_path, 'w', newline='')
-            self.batch_csv_writer = csv.writer(self.batch_csv_file)
-            self.batch_csv_writer.writerow([
-                'iteration', 'timestamp', 'iteration_time_ms',
-                'new_reqs', 'running_reqs', 'resumed_reqs', 'total_reqs',
-                'total_tokens', 'waiting_reqs', 'preempted_reqs',
-                'prefill_reqs', 'decode_reqs', 'prefill_ratio'
-            ])
-            self.batch_csv_file.flush()
-            
-            # Request log CSV - iteration마다 각 request별로 한 행씩
-            request_csv_path = os.path.join(
-                self.csv_log_dir,
-                f"request_log_dp{self.parallel_config.data_parallel_rank}.csv"
-            )
-            self.request_csv_file = open(request_csv_path, 'w', newline='')
-            self.request_csv_writer = csv.writer(self.request_csv_file)
-            self.request_csv_writer.writerow([
-                'iteration', 'timestamp', 'request_id', 'phase',
-                'num_prompt_tokens', 'num_output_tokens', 'num_computed_tokens',
-                'chunk_start', 'chunk_end', 'num_scheduled_tokens'
-            ])
-            self.request_csv_file.flush()
+            self._open_csv_files()
             
             logger.info(f"CSV logging enabled. Logs will be saved to {self.csv_log_dir}")
+
+    def _open_csv_files(self) -> None:
+        """Open CSV files for logging. Creates new files or rotates existing ones."""
+        if not self.csv_log_dir:
+            return
+        
+        # Close existing files if open
+        self._close_csv_files()
+        
+        # Batch log CSV - iteration마다 한 행
+        batch_csv_path = os.path.join(
+            self.csv_log_dir, 
+            f"batch_log_dp{self.parallel_config.data_parallel_rank}_part{self.csv_file_counter}.csv"
+        )
+        self.batch_csv_file = open(batch_csv_path, 'w', newline='', buffering=1)  # Line buffering
+        self.batch_csv_writer = csv.writer(self.batch_csv_file)
+        self.batch_csv_writer.writerow([
+            'iteration', 'timestamp', 'iteration_time_ms',
+            'new_reqs', 'running_reqs', 'resumed_reqs', 'total_reqs',
+            'total_tokens', 'waiting_reqs', 'preempted_reqs',
+            'prefill_reqs', 'decode_reqs', 'prefill_ratio'
+        ])
+        self.batch_csv_file.flush()
+        
+        # Request log CSV - iteration마다 각 request별로 한 행씩
+        request_csv_path = os.path.join(
+            self.csv_log_dir,
+            f"request_log_dp{self.parallel_config.data_parallel_rank}_part{self.csv_file_counter}.csv"
+        )
+        self.request_csv_file = open(request_csv_path, 'w', newline='', buffering=1)  # Line buffering
+        self.request_csv_writer = csv.writer(self.request_csv_file)
+        self.request_csv_writer.writerow([
+            'iteration', 'timestamp', 'request_id', 'phase',
+            'num_prompt_tokens', 'num_output_tokens', 'num_computed_tokens',
+            'chunk_start', 'chunk_end', 'num_scheduled_tokens'
+        ])
+        self.request_csv_file.flush()
+        
+        self.csv_rows_written = 0
+        logger.info(f"Opened CSV files part {self.csv_file_counter}: {batch_csv_path}, {request_csv_path}")
+
+    def _close_csv_files(self) -> None:
+        """Close CSV files if they are open."""
+        if self.batch_csv_file is not None:
+            try:
+                self.batch_csv_file.flush()
+                self.batch_csv_file.close()
+            except Exception as e:
+                logger.warning(f"Error closing batch CSV file: {e}")
+            finally:
+                self.batch_csv_file = None
+                self.batch_csv_writer = None
+        
+        if self.request_csv_file is not None:
+            try:
+                self.request_csv_file.flush()
+                self.request_csv_file.close()
+            except Exception as e:
+                logger.warning(f"Error closing request CSV file: {e}")
+            finally:
+                self.request_csv_file = None
+                self.request_csv_writer = None
+
+    def _check_and_rotate_csv_files(self) -> None:
+        """Check if CSV files need to be rotated based on row count."""
+        if not self.csv_log_dir:
+            return
+        
+        # Rotate when we reach the max rows limit
+        # Note: This tracks request rows (more accurate) but applies to both files
+        if self.csv_rows_written >= self.csv_max_rows:
+            logger.info(
+                f"CSV file rotation: {self.csv_rows_written} rows written, "
+                f"rotating to part {self.csv_file_counter + 1}"
+            )
+            self.csv_file_counter += 1
+            self._open_csv_files()
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -768,6 +820,9 @@ class Scheduler(SchedulerInterface):
             
             # CSV 로깅 (환경변수로 활성화된 경우)
             if self.csv_log_dir and self.batch_csv_writer and self.request_csv_writer:
+                # Check if file rotation is needed before writing
+                self._check_and_rotate_csv_files()
+                
                 current_timestamp = time.time()
                 
                 # Batch log - iteration당 한 행
@@ -789,6 +844,7 @@ class Scheduler(SchedulerInterface):
                 self.batch_csv_file.flush()
                 
                 # Request log - 각 request별로 한 행씩
+                request_rows_written = 0
                 for req in all_scheduled_reqs:
                     info = running_req_token_info[req.request_id]
                     
@@ -827,8 +883,12 @@ class Scheduler(SchedulerInterface):
                         chunk_end,
                         num_scheduled_tokens.get(req.request_id, 0)
                     ])
+                    request_rows_written += 1
                 self.request_csv_file.flush()
                 
+                # Increment row counter (track both batch and request rows)
+                # Use request rows as the primary counter since it's more accurate
+                self.csv_rows_written += request_rows_written
                 self.iteration_counter += 1
 
         self._update_after_schedule(scheduler_output)
@@ -1530,6 +1590,8 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
             self.connector.shutdown()
+        # Close CSV files
+        self._close_csv_files()
 
     ########################################################################
     # KV Connector Related Methods
