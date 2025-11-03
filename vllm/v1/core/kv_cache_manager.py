@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Literal, Optional, overload
+from typing import TYPE_CHECKING, Literal, Optional, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -11,6 +11,12 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+
+if TYPE_CHECKING:
+    from vllm.transformers_utils.tokenizer_base import TokenizerBase
+    AnyTokenizer = TokenizerBase
+else:
+    AnyTokenizer = Optional[object]
 
 logger = init_logger(__name__)
 
@@ -93,6 +99,7 @@ class KVCacheManager:
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
+        tokenizer: Optional[AnyTokenizer] = None,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -129,6 +136,7 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self.tokenizer = tokenizer
 
     @property
     def usage(self) -> float:
@@ -187,6 +195,100 @@ class KVCacheManager:
             self.prefix_cache_stats.requests += 1
             self.prefix_cache_stats.queries += request.num_tokens
             self.prefix_cache_stats.hits += num_new_computed_tokens
+
+        # Log prefix cache hit with request content for debugging
+        if num_new_computed_tokens > 0:
+            # Log prefix cache hit information
+            prompt_token_ids = request.prompt_token_ids
+            if prompt_token_ids is not None:
+                # Extract the cached portion tokens (first N tokens)
+                # These tokens match what was previously cached
+                cached_end = min(num_new_computed_tokens, len(prompt_token_ids))
+                cached_tokens = prompt_token_ids[:cached_end]
+                
+                # Calculate how many blocks were cached
+                num_cached_blocks = (cached_end // self.block_size) if self.block_size and self.block_size > 0 else 0
+                
+                # Log cached portion and full prompt for debugging
+                max_log_tokens = 200  # Increased limit for better comparison
+                cached_tokens_preview = cached_tokens[:min(len(cached_tokens), max_log_tokens)]
+                full_prompt_preview = prompt_token_ids[:min(len(prompt_token_ids), max_log_tokens)]
+                
+                # Try to decode token ids to text if tokenizer is available
+                cached_text_preview = None
+                full_prompt_text_preview = None
+                cached_tokens_full_text = None
+                if self.tokenizer is not None:
+                    try:
+                        cached_text_preview = self.tokenizer.decode(
+                            cached_tokens_preview, skip_special_tokens=False
+                        )
+                        full_prompt_text_preview = self.tokenizer.decode(
+                            full_prompt_preview, skip_special_tokens=False
+                        )
+                        cached_tokens_full_text = self.tokenizer.decode(
+                            cached_tokens, skip_special_tokens=False
+                        )
+                    except Exception:
+                        # If decoding fails, just log token ids
+                        pass
+                
+                # Log detailed comparison information
+                if cached_text_preview is not None and full_prompt_text_preview is not None:
+                    logger.info(
+                        "Prefix cache hit for request %s:\n"
+                        "  Cached tokens: %d/%d (%.1f%%)\n"
+                        "  Cached blocks: %d (block_size=%d)\n"
+                        "  Cached text (first %d tokens): %r\n"
+                        "  Full prompt text (first %d tokens): %r\n"
+                        "  Verification: The first %d tokens of this request match cached content",
+                        request.request_id,
+                        num_new_computed_tokens,
+                        request.num_tokens,
+                        (num_new_computed_tokens / request.num_tokens * 100) if request.num_tokens > 0 else 0,
+                        num_cached_blocks,
+                        self.block_size if self.block_size else 0,
+                        min(cached_end, max_log_tokens),
+                        cached_text_preview,
+                        min(len(prompt_token_ids), max_log_tokens),
+                        full_prompt_text_preview,
+                        cached_end,
+                    )
+                    # Log full cached text if different from preview
+                    if cached_tokens_full_text and cached_tokens_full_text != cached_text_preview:
+                        logger.info(
+                            "  Full cached text (%d tokens): %r",
+                            cached_end,
+                            cached_tokens_full_text,
+                        )
+                else:
+                    logger.info(
+                        "Prefix cache hit for request %s:\n"
+                        "  Cached tokens: %d/%d (%.1f%%)\n"
+                        "  Cached blocks: %d (block_size=%d)\n"
+                        "  Cached token_ids (first %d): %s\n"
+                        "  Full prompt token_ids (first %d): %s\n"
+                        "  Verification: The first %d token_ids of this request match cached content",
+                        request.request_id,
+                        num_new_computed_tokens,
+                        request.num_tokens,
+                        (num_new_computed_tokens / request.num_tokens * 100) if request.num_tokens > 0 else 0,
+                        num_cached_blocks,
+                        self.block_size if self.block_size else 0,
+                        min(cached_end, max_log_tokens),
+                        cached_tokens_preview,
+                        min(len(prompt_token_ids), max_log_tokens),
+                        full_prompt_preview,
+                        cached_end,
+                    )
+            else:
+                logger.info(
+                    "Prefix cache hit for request %s: "
+                    "cached_tokens=%d/%d (prompt_token_ids not available)",
+                    request.request_id,
+                    num_new_computed_tokens,
+                    request.num_tokens,
+                )
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
 
