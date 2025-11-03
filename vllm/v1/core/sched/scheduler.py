@@ -169,7 +169,7 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
-        # Initialize tokenizer for logging purposes if not skipped
+        # [NOTE, hyunnnchoi, 2025.11.03] Initialize tokenizer for logging purposes if not skipped
         tokenizer = None
         if not self.vllm_config.model_config.skip_tokenizer_init:
             try:

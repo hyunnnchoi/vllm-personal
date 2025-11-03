@@ -136,6 +136,7 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        # [NOTE, hyunnnchoi, 2025.11.03] Store tokenizer for decoding token_ids to readable text in logs
         self.tokenizer = tokenizer
 
     @property
@@ -196,7 +197,7 @@ class KVCacheManager:
             self.prefix_cache_stats.queries += request.num_tokens
             self.prefix_cache_stats.hits += num_new_computed_tokens
 
-        # Log prefix cache hit with request content for debugging
+        # [NOTE, hyunnnchoi, 2025.11.03] Log prefix cache hit with request content for debugging
         if num_new_computed_tokens > 0:
             # Log prefix cache hit information
             prompt_token_ids = request.prompt_token_ids
