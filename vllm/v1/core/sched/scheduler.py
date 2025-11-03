@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.transformers_utils.tokenizer import init_tokenizer_from_configs
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -168,6 +169,17 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
+        # Initialize tokenizer for logging purposes if not skipped
+        tokenizer = None
+        if not self.vllm_config.model_config.skip_tokenizer_init:
+            try:
+                tokenizer = init_tokenizer_from_configs(
+                    model_config=self.vllm_config.model_config)
+            except Exception:
+                # If tokenizer initialization fails, continue without it
+                logger.warning("Failed to initialize tokenizer for prefix cache logging")
+                tokenizer = None
+        
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -176,6 +188,7 @@ class Scheduler(SchedulerInterface):
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
+            tokenizer=tokenizer,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
