@@ -163,12 +163,13 @@ def process_all_prompts(
         batch_size: 동시에 처리할 요청 수
     """
     # [NOTE, hyunnnchoi, 2025.11.12] tokenizer 로드
+    # [NOTE, hyunnnchoi, 2025.11.16] tokenizer_path가 없을 때 model_name 사용하도록 수정
     print(f"🔧 Tokenizer 로딩 중...")
     if tokenizer_path is None:
-        tokenizer_path = "/model"  # vLLM 서버의 모델 경로
+        tokenizer_path = model_name  # model_name을 tokenizer 경로로 사용
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        print(f"✅ Tokenizer 로드 완료\n")
+        print(f"✅ Tokenizer 로드 완료: {tokenizer_path}\n")
     except Exception as e:
         print(f"⚠️ Tokenizer 로드 실패, 기본 tokenizer 사용: {e}\n")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")  # fallback
@@ -177,8 +178,12 @@ def process_all_prompts(
     prompts = load_prompts(json_file_path)
     print(f"✅ {len(prompts)}개의 프롬프트를 로드했습니다.\n")
     
+    # [NOTE, hyunnnchoi, 2025.11.12] 실시간 저장을 위해 파일을 먼저 열기
+    training_output_path = output_file_path.replace('.json', '_training.jsonl')
+    print(f"💾 학습 데이터 파일 생성: {training_output_path}")
+    training_file = open(training_output_path, 'w', encoding='utf-8')
+    
     results = []
-    training_data = []  # JSONL 형식으로 저장할 학습 데이터
     success_count = 0
     fail_count = 0
     total_training_samples = 0
@@ -214,7 +219,7 @@ def process_all_prompts(
             try:
                 idx, prompt, response = future.result()
                 
-                # input/output을 명확하게 저장하고 50토큰씩 누적으로 자르기
+                # [NOTE, hyunnnchoi, 2025.11.12] input/output을 실시간으로 저장
                 if response:
                     # 생성된 텍스트 추출
                     output_text = ""
@@ -225,7 +230,7 @@ def process_all_prompts(
                     if output_text.strip():
                         chunks = slice_output_by_tokens(output_text, tokenizer, chunk_size=50)
                         
-                        # 각 청크를 training_data에 추가
+                        # 각 청크를 바로 파일에 쓰기 (실시간 저장)
                         for chunk in chunks:
                             training_entry = {
                                 "input_prompt": prompt,
@@ -233,7 +238,8 @@ def process_all_prompts(
                                 "number_of_output_tokens": chunk["num_tokens"],
                                 "remaining_tokens": chunk["remaining_tokens"]
                             }
-                            training_data.append(training_entry)
+                            training_file.write(json.dumps(training_entry, ensure_ascii=False) + '\n')
+                            training_file.flush()  # 버퍼를 즉시 디스크에 쓰기
                             total_training_samples += 1
                     
                     result_entry = {
@@ -268,12 +274,9 @@ def process_all_prompts(
                 results.append(result_entry)
                 fail_count += 1
     
-    # [NOTE, hyunnnchoi, 2025.11.12] JSONL 형식으로 학습 데이터 저장
-    training_output_path = output_file_path.replace('.json', '_training.jsonl')
-    print(f"\n💾 학습 데이터 저장 중: {training_output_path}")
-    with open(training_output_path, 'w', encoding='utf-8') as f:
-        for entry in training_data:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    # [NOTE, hyunnnchoi, 2025.11.12] 실시간 저장 완료, 파일 닫기
+    training_file.close()
+    print(f"\n✅ 학습 데이터 실시간 저장 완료: {training_output_path}")
     
     # 원본 결과도 JSON으로 저장 (디버깅용)
     print(f"💾 원본 결과 저장 중: {output_file_path}")
@@ -341,11 +344,12 @@ if __name__ == "__main__":
         help="각 요청 사이의 대기 시간 (초)"
     )
     # [NOTE, hyunnnchoi, 2025.11.12] tokenizer 경로 인자 추가
+    # [NOTE, hyunnnchoi, 2025.11.16] help 메시지 수정
     parser.add_argument(
         "--tokenizer-path",
         type=str,
         default=None,
-        help="Tokenizer 경로 (기본값: /model)"
+        help="Tokenizer 경로 (기본값: --model과 동일한 값 사용)"
     )
     # [NOTE, hyunnnchoi, 2025.11.12] 배치 크기 인자 추가
     parser.add_argument(
