@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-vLLM 서버에 프롬프트를 전송하는 스크립트
+Script to send prompts to vLLM server
 """
 import json
 import requests
 from typing import List, Dict, Optional
 import time
 from tqdm import tqdm
-# [NOTE, hyunnnchoi, 2025.11.12] tokenizer 추가 for output slicing
+# [NOTE, hyunnnchoi, 2025.11.12] Added tokenizer for output slicing
 from transformers import AutoTokenizer
-# [NOTE, hyunnnchoi, 2025.11.12] 병렬 처리를 위한 모듈 추가
+# [NOTE, hyunnnchoi, 2025.11.12] Added module for parallel processing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# [NOTE, hyunnnchoi, 2025.11.12] vLLM 서버 설정
-VLLM_SERVER_URL = "http://localhost:8000/v1/completions"  # vLLM 서버 URL
-# [NOTE, hyunnnchoi, 2025.11.12] 모델 이름을 gpt-oss-20b로 변경
-MODEL_NAME = "gpt-oss-20b"  # 사용할 모델 이름
+# [NOTE, hyunnnchoi, 2025.11.12] vLLM server configuration
+VLLM_SERVER_URL = "http://localhost:8000/v1/completions"  # vLLM server URL
+# [NOTE, hyunnnchoi, 2025.11.12] Changed model name to gpt-oss-20b
+MODEL_NAME = "gpt-oss-20b"  # Model name to use
 
 
 def load_prompts(json_file_path: str) -> List[str]:
     """
-    JSON 파일에서 프롬프트 목록을 로드합니다.
+    Loads a list of prompts from a JSON file.
     
     Args:
-        json_file_path: JSON 파일 경로
+        json_file_path: Path to the JSON file
         
     Returns:
-        프롬프트 문자열 리스트
+        List of prompt strings
     """
     with open(json_file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -34,36 +34,36 @@ def load_prompts(json_file_path: str) -> List[str]:
     return data.get('prompts', [])
 
 
-# [NOTE, hyunnnchoi, 2025.11.12] 50토큰씩 누적으로 output을 자르는 함수 추가
+# [NOTE, hyunnnchoi, 2025.11.12] Added function to slice output cumulatively by 50 tokens
 def slice_output_by_tokens(output_text: str, tokenizer, chunk_size: int = 50) -> List[Dict]:
     """
-    output 텍스트를 50토큰씩 누적으로 자르고, 각 청크에 대한 정보를 반환합니다.
+    Slices the output text cumulatively by 50 tokens and returns information for each chunk.
     
     Args:
-        output_text: 전체 output 텍스트
-        tokenizer: 사용할 tokenizer
-        chunk_size: 청크 크기 (기본값: 50)
+        output_text: Full output text
+        tokenizer: Tokenizer to use
+        chunk_size: Chunk size (default: 50)
         
     Returns:
-        각 청크의 정보를 담은 딕셔너리 리스트
+        List of dictionaries containing information for each chunk
         [
-            {"output_text": "0~50토큰", "num_tokens": 50, "remaining_tokens": 100},
-            {"output_text": "0~100토큰", "num_tokens": 100, "remaining_tokens": 50},
+            {"output_text": "0~50 tokens", "num_tokens": 50, "remaining_tokens": 100},
+            {"output_text": "0~100 tokens", "num_tokens": 100, "remaining_tokens": 50},
             ...
         ]
     """
-    # output 텍스트를 토큰화
+    # Tokenize output text
     tokens = tokenizer.encode(output_text, add_special_tokens=False)
     total_tokens = len(tokens)
     
     chunks = []
     current_pos = 0
     
-    # 50토큰씩 누적으로 자르기
+    # Slice cumulatively by 50 tokens
     while current_pos < total_tokens:
         next_pos = min(current_pos + chunk_size, total_tokens)
         
-        # 0부터 next_pos까지의 토큰을 디코딩
+        # Decode tokens from 0 to next_pos
         chunk_tokens = tokens[:next_pos]
         chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
         
@@ -75,7 +75,7 @@ def slice_output_by_tokens(output_text: str, tokenizer, chunk_size: int = 50) ->
         
         current_pos = next_pos
     
-    # 마지막 청크가 정확히 total_tokens가 아니면 전체를 추가
+    # If the last chunk is not exactly total_tokens, add the whole text
     if not chunks or chunks[-1]["num_tokens"] < total_tokens:
         full_text = tokenizer.decode(tokens, skip_special_tokens=True)
         chunks.append({
@@ -97,21 +97,21 @@ def send_to_vllm(
     timeout: int = 300
 ) -> Optional[Dict]:
     """
-    단일 프롬프트를 vLLM 서버에 전송합니다.
+    Sends a single prompt to the vLLM server.
     
     Args:
-        prompt: 전송할 프롬프트
-        server_url: vLLM 서버 URL
-        model_name: 모델 이름
-        max_tokens: 생성할 최대 토큰 수 (None이면 제한 없음)
-        temperature: 샘플링 온도
-        top_p: nucleus sampling 파라미터
-        timeout: 요청 타임아웃 (초)
+        prompt: Prompt to send
+        server_url: vLLM server URL
+        model_name: Model name
+        max_tokens: Maximum tokens to generate (None for no limit)
+        temperature: Sampling temperature
+        top_p: Nucleus sampling parameter
+        timeout: Request timeout (seconds)
         
     Returns:
-        API 응답 또는 None (에러 발생 시)
+        API response or None (if error occurs)
     """
-    # [NOTE, hyunnnchoi, 2025.11.12] max_tokens 제한 제거 옵션 추가
+    # [NOTE, hyunnnchoi, 2025.11.12] Added option to remove max_tokens limit
     payload = {
         "model": model_name,
         "prompt": prompt,
@@ -119,7 +119,7 @@ def send_to_vllm(
         "top_p": top_p,
     }
     
-    # max_tokens가 지정된 경우만 추가
+    # Add only if max_tokens is specified
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     
@@ -133,7 +133,7 @@ def send_to_vllm(
         return response.json()
         
     except requests.exceptions.RequestException as e:
-        print(f"❌ 요청 실패: {str(e)}")
+        print(f"❌ Request failed: {str(e)}")
         return None
 
 
@@ -149,38 +149,38 @@ def process_all_prompts(
     batch_size: int = 16
 ):
     """
-    모든 프롬프트를 처리하고 결과를 저장합니다.
+    Processes all prompts and saves the results.
     
     Args:
-        json_file_path: 입력 JSON 파일 경로
-        output_file_path: 출력 JSONL 파일 경로
-        server_url: vLLM 서버 URL
-        model_name: 모델 이름
-        max_tokens: 생성할 최대 토큰 수 (None이면 제한 없음)
-        temperature: 샘플링 온도
-        batch_delay: 각 요청 사이의 대기 시간 (초)
-        tokenizer_path: tokenizer 경로 (None이면 model_name 사용)
-        batch_size: 동시에 처리할 요청 수
+        json_file_path: Input JSON file path
+        output_file_path: Output JSONL file path
+        server_url: vLLM server URL
+        model_name: Model name
+        max_tokens: Maximum tokens to generate (None for no limit)
+        temperature: Sampling temperature
+        batch_delay: Wait time between requests (seconds)
+        tokenizer_path: Tokenizer path (if None, use model_name)
+        batch_size: Number of requests to process concurrently
     """
-    # [NOTE, hyunnnchoi, 2025.11.12] tokenizer 로드
-    # [NOTE, hyunnnchoi, 2025.11.16] tokenizer_path가 없을 때 model_name 사용하도록 수정
-    print(f"🔧 Tokenizer 로딩 중...")
+    # [NOTE, hyunnnchoi, 2025.11.12] Load tokenizer
+    # [NOTE, hyunnnchoi, 2025.11.16] Modified to use model_name when tokenizer_path is missing
+    print(f"🔧 Loading Tokenizer...")
     if tokenizer_path is None:
-        tokenizer_path = model_name  # model_name을 tokenizer 경로로 사용
+        tokenizer_path = model_name  # Use model_name as tokenizer path
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-        print(f"✅ Tokenizer 로드 완료: {tokenizer_path}\n")
+        print(f"✅ Tokenizer loaded: {tokenizer_path}\n")
     except Exception as e:
-        print(f"⚠️ Tokenizer 로드 실패, 기본 tokenizer 사용: {e}\n")
+        print(f"⚠️ Tokenizer load failed, using default tokenizer: {e}\n")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")  # fallback
     
-    print(f"📂 파일 로딩 중: {json_file_path}")
+    print(f"📂 Loading file: {json_file_path}")
     prompts = load_prompts(json_file_path)
-    print(f"✅ {len(prompts)}개의 프롬프트를 로드했습니다.\n")
+    print(f"✅ Loaded {len(prompts)} prompts.\n")
     
-    # [NOTE, hyunnnchoi, 2025.11.12] 실시간 저장을 위해 파일을 먼저 열기
+    # [NOTE, hyunnnchoi, 2025.11.12] Open file first for real-time saving
     training_output_path = output_file_path.replace('.json', '_training.jsonl')
-    print(f"💾 학습 데이터 파일 생성: {training_output_path}")
+    print(f"💾 Creating training data file: {training_output_path}")
     training_file = open(training_output_path, 'w', encoding='utf-8')
     
     results = []
@@ -188,13 +188,13 @@ def process_all_prompts(
     fail_count = 0
     total_training_samples = 0
     
-    print(f"🚀 vLLM 서버로 요청 전송 시작...")
-    print(f"   서버 URL: {server_url}")
-    print(f"   모델: {model_name}")
-    print(f"   배치 크기: {batch_size}")
-    print(f"   Max tokens: {'제한 없음' if max_tokens is None else max_tokens}\n")
+    print(f"🚀 Starting request transmission to vLLM server...")
+    print(f"   Server URL: {server_url}")
+    print(f"   Model: {model_name}")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Max tokens: {'No limit' if max_tokens is None else max_tokens}\n")
     
-    # [NOTE, hyunnnchoi, 2025.11.12] 병렬 처리를 위한 헬퍼 함수
+    # [NOTE, hyunnnchoi, 2025.11.12] Helper function for parallel processing
     def process_single_prompt(idx_prompt_tuple):
         idx, prompt = idx_prompt_tuple
         response = send_to_vllm(
@@ -206,31 +206,31 @@ def process_all_prompts(
         )
         return idx, prompt, response
     
-    # [NOTE, hyunnnchoi, 2025.11.12] ThreadPoolExecutor로 병렬 처리
+    # [NOTE, hyunnnchoi, 2025.11.12] Parallel processing with ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
-        # 모든 프롬프트를 인덱스와 함께 제출
+        # Submit all prompts with index
         futures = {
             executor.submit(process_single_prompt, (idx, prompt)): idx
             for idx, prompt in enumerate(prompts)
         }
         
-        # 완료된 작업을 처리
-        for future in tqdm(as_completed(futures), total=len(prompts), desc="처리 중"):
+        # Process completed tasks
+        for future in tqdm(as_completed(futures), total=len(prompts), desc="Processing"):
             try:
                 idx, prompt, response = future.result()
                 
-                # [NOTE, hyunnnchoi, 2025.11.12] input/output을 실시간으로 저장
+                # [NOTE, hyunnnchoi, 2025.11.12] Save input/output in real-time
                 if response:
-                    # 생성된 텍스트 추출
+                    # Extract generated text
                     output_text = ""
                     if "choices" in response and len(response["choices"]) > 0:
                         output_text = response["choices"][0].get("text", "")
                     
-                    # output을 50토큰씩 누적으로 자르기
+                    # Slice output cumulatively by 50 tokens
                     if output_text.strip():
                         chunks = slice_output_by_tokens(output_text, tokenizer, chunk_size=50)
                         
-                        # 각 청크를 바로 파일에 쓰기 (실시간 저장)
+                        # Write each chunk directly to file (real-time saving)
                         for chunk in chunks:
                             training_entry = {
                                 "input_prompt": prompt,
@@ -239,7 +239,7 @@ def process_all_prompts(
                                 "remaining_tokens": chunk["remaining_tokens"]
                             }
                             training_file.write(json.dumps(training_entry, ensure_ascii=False) + '\n')
-                            training_file.flush()  # 버퍼를 즉시 디스크에 쓰기
+                            training_file.flush()  # Flush buffer to disk immediately
                             total_training_samples += 1
                     
                     result_entry = {
@@ -263,7 +263,7 @@ def process_all_prompts(
                 results.append(result_entry)
                 
             except Exception as e:
-                print(f"\n❌ 예외 발생 (idx={futures[future]}): {str(e)}")
+                print(f"\n❌ Exception occurred (idx={futures[future]}): {str(e)}")
                 result_entry = {
                     "index": futures[future],
                     "input_prompt": prompts[futures[future]],
@@ -274,12 +274,12 @@ def process_all_prompts(
                 results.append(result_entry)
                 fail_count += 1
     
-    # [NOTE, hyunnnchoi, 2025.11.12] 실시간 저장 완료, 파일 닫기
+    # [NOTE, hyunnnchoi, 2025.11.12] Real-time saving completed, close file
     training_file.close()
-    print(f"\n✅ 학습 데이터 실시간 저장 완료: {training_output_path}")
+    print(f"\n✅ Real-time saving of training data completed: {training_output_path}")
     
-    # 원본 결과도 JSON으로 저장 (디버깅용)
-    print(f"💾 원본 결과 저장 중: {output_file_path}")
+    # Save original results as JSON (for debugging)
+    print(f"💾 Saving original results: {output_file_path}")
     with open(output_file_path, 'w', encoding='utf-8') as f:
         json.dump({
             "total": len(prompts),
@@ -289,74 +289,74 @@ def process_all_prompts(
             "results": results
         }, f, ensure_ascii=False, indent=2)
     
-    print(f"\n✅ 완료!")
-    print(f"   총 프롬프트: {len(prompts)}개")
-    print(f"   성공: {success_count}, 실패: {fail_count}")
-    print(f"   학습 데이터 샘플 수: {total_training_samples}개")
-    print(f"   학습 데이터 파일: {training_output_path}")
-    print(f"   원본 결과 파일: {output_file_path}")
+    print(f"\n✅ Completed!")
+    print(f"   Total prompts: {len(prompts)}")
+    print(f"   Success: {success_count}, Failed: {fail_count}")
+    print(f"   Training data samples: {total_training_samples}")
+    print(f"   Training data file: {training_output_path}")
+    print(f"   Original results file: {output_file_path}")
 
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="vLLM 서버에 프롬프트 전송")
+    parser = argparse.ArgumentParser(description="Send prompts to vLLM server")
     parser.add_argument(
         "--input",
         type=str,
         default="/data/processed_dataset.json",
-        help="입력 JSON 파일 경로"
+        help="Input JSON file path"
     )
     parser.add_argument(
         "--output",
         type=str,
         default="/data/vllm_results.json",
-        help="출력 JSON 파일 경로"
+        help="Output JSON file path"
     )
     parser.add_argument(
         "--server-url",
         type=str,
         default=VLLM_SERVER_URL,
-        help="vLLM 서버 URL"
+        help="vLLM server URL"
     )
     parser.add_argument(
         "--model",
         type=str,
         default=MODEL_NAME,
-        help="모델 이름"
+        help="Model name"
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
         default=None,
-        help="생성할 최대 토큰 수 (기본값: None, 제한 없음)"
+        help="Maximum tokens to generate (default: None, no limit)"
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.7,
-        help="샘플링 온도"
+        help="Sampling temperature"
     )
     parser.add_argument(
         "--delay",
         type=float,
         default=0.0,
-        help="각 요청 사이의 대기 시간 (초)"
+        help="Wait time between requests (seconds)"
     )
-    # [NOTE, hyunnnchoi, 2025.11.12] tokenizer 경로 인자 추가
-    # [NOTE, hyunnnchoi, 2025.11.16] help 메시지 수정
+    # [NOTE, hyunnnchoi, 2025.11.12] Added tokenizer path argument
+    # [NOTE, hyunnnchoi, 2025.11.16] Modified help message
     parser.add_argument(
         "--tokenizer-path",
         type=str,
         default=None,
-        help="Tokenizer 경로 (기본값: --model과 동일한 값 사용)"
+        help="Tokenizer path (default: same as --model)"
     )
-    # [NOTE, hyunnnchoi, 2025.11.12] 배치 크기 인자 추가
+    # [NOTE, hyunnnchoi, 2025.11.12] Added batch size argument
     parser.add_argument(
         "--batch-size",
         type=int,
         default=16,
-        help="동시에 처리할 요청 수 (기본값: 16)"
+        help="Number of requests to process concurrently (default: 16)"
     )
     
     args = parser.parse_args()

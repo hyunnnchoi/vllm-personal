@@ -18,7 +18,9 @@ from vllm.utils import (DEFAULT_MAX_NUM_BATCHED_TOKENS,
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+# [NOTE, hyunnnchoi, 2025.12.01] Added "isrtf" for ELIS scheduling
+# Based on: https://arxiv.org/abs/2505.09142
+SchedulerPolicy = Literal["fcfs", "priority", "isrtf"]
 
 
 @config
@@ -109,7 +111,10 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order
     of arrival.\n
     - "priority" means requests are handled based on given priority (lower
-    value means earlier handling) and time of arrival deciding any ties)."""
+    value means earlier handling) and time of arrival deciding any ties).\n
+    - "isrtf" means Iterative Shortest Remaining Time First, using ELIS
+    (https://arxiv.org/abs/2505.09142) to predict remaining tokens and
+    prioritize requests with fewer predicted remaining tokens."""
 
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""

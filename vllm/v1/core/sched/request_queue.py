@@ -16,6 +16,9 @@ class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
     FCFS = "fcfs"
     PRIORITY = "priority"
+    # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling policy
+    # Based on: https://arxiv.org/abs/2505.09142
+    ISRTF = "isrtf"
 
 
 class RequestQueue(ABC):
@@ -214,11 +217,141 @@ class PriorityRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
+# [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF Request Queue
+# Based on: https://arxiv.org/abs/2505.09142
+class ISRTFRequestQueue(RequestQueue):
+    """
+    Iterative Shortest Remaining Time First (ISRTF) queue for ELIS scheduling.
+    
+    Requests with smaller predicted_remaining_tokens are processed first.
+    If multiple requests have the same predicted tokens, the one with the 
+    earlier arrival_time is processed first.
+    
+    This implements the ISRTF scheduling from the ELIS paper:
+    - Requests are prioritized by predicted remaining output tokens
+    - Predictions are updated every 50 tokens (handled by scheduler)
+    - Lower remaining tokens = higher priority
+    """
+
+    def __init__(self) -> None:
+        # Heap entries: (predicted_remaining_tokens, arrival_time, request)
+        self._heap: list[tuple[float, float, Request]] = []
+        # Track requests for efficient removal
+        self._request_set: set[str] = set()
+
+    def add_request(self, request: Request) -> None:
+        """Add a request to the queue according to ISRTF policy."""
+        if request.request_id in self._request_set:
+            return  # Already in queue
+        heapq.heappush(
+            self._heap,
+            (request.predicted_remaining_tokens, request.arrival_time, request)
+        )
+        self._request_set.add(request.request_id)
+
+    def pop_request(self) -> Request:
+        """Pop a request with shortest predicted remaining tokens."""
+        if not self._heap:
+            raise IndexError("pop from empty heap")
+        while self._heap:
+            _, _, request = heapq.heappop(self._heap)
+            if request.request_id in self._request_set:
+                self._request_set.remove(request.request_id)
+                return request
+        raise IndexError("pop from empty heap")
+
+    def peek_request(self) -> Request:
+        """Peek at the request with shortest predicted remaining tokens."""
+        if not self._heap:
+            raise IndexError("peek from empty heap")
+        # Skip removed requests
+        while self._heap and self._heap[0][2].request_id not in self._request_set:
+            heapq.heappop(self._heap)
+        if not self._heap:
+            raise IndexError("peek from empty heap")
+        _, _, request = self._heap[0]
+        return request
+
+    def prepend_request(self, request: Request) -> None:
+        """Add a request to the queue according to ISRTF policy.
+        
+        Note: In ISRTF, there is no concept of prepending. Requests are 
+        ordered by (predicted_remaining_tokens, arrival_time)."""
+        self.add_request(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        """Add all requests from another queue according to ISRTF policy."""
+        for request in requests:
+            self.add_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        """Remove a specific request from the queue."""
+        self._request_set.discard(request.request_id)
+        # Lazy removal - actual heap entry will be skipped in pop/peek
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        """Remove multiple specific requests from the queue."""
+        for request in requests:
+            self._request_set.discard(request.request_id)
+
+    def update_request_priority(self, request: Request) -> None:
+        """
+        Update request priority after prediction update.
+        
+        This is called when the predicted_remaining_tokens is updated
+        (every 50 tokens as per ELIS paper).
+        """
+        if request.request_id not in self._request_set:
+            return
+        # Re-add with updated priority (old entry will be skipped via lazy removal)
+        heapq.heappush(
+            self._heap,
+            (request.predicted_remaining_tokens, request.arrival_time, request)
+        )
+
+    def _cleanup_heap(self) -> None:
+        """Remove stale entries from the heap."""
+        self._heap = [
+            (p, t, r) for p, t, r in self._heap 
+            if r.request_id in self._request_set
+        ]
+        heapq.heapify(self._heap)
+
+    def __bool__(self) -> bool:
+        """Check if queue has any requests."""
+        return bool(self._request_set)
+
+    def __len__(self) -> int:
+        """Get number of requests in queue."""
+        return len(self._request_set)
+
+    def __iter__(self) -> Iterator[Request]:
+        """Iterate over the queue according to ISRTF policy."""
+        # Create sorted list by (predicted_remaining_tokens, arrival_time)
+        valid_requests = [
+            (p, t, r) for p, t, r in self._heap 
+            if r.request_id in self._request_set
+        ]
+        valid_requests.sort(key=lambda x: (x[0], x[1]))
+        seen = set()
+        for _, _, request in valid_requests:
+            if request.request_id not in seen:
+                seen.add(request.request_id)
+                yield request
+
+    def __reversed__(self) -> Iterator[Request]:
+        """Iterate over the queue in reverse ISRTF order."""
+        return reversed(list(self))
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling
+    elif policy == SchedulingPolicy.ISRTF:
+        return ISRTFRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

@@ -126,6 +126,12 @@ class Request:
         # Each entry: (token_id, timestamp_ms, num_output_tokens_so_far)
         self.decode_step_timings: list[tuple[int, float, int]] = []
         self.first_token_timestamp: Optional[float] = None
+        
+        # [NOTE, hyunnnchoi, 2025.12.01] ELIS: Predicted remaining tokens for ISRTF scheduling
+        # Based on: https://arxiv.org/abs/2505.09142
+        self.predicted_remaining_tokens: float = float('inf')  # Initial: infinity (unknown)
+        self.last_prediction_at_tokens: int = 0  # Last prediction was made at this token count
+        self.prediction_history: list[tuple[int, float]] = []  # (token_count, predicted_remaining)
 
     @classmethod
     def from_engine_core_request(

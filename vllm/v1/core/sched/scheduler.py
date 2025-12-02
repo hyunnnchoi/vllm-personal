@@ -30,7 +30,8 @@ from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
-                                              create_request_queue)
+                                              create_request_queue,
+                                              ISRTFRequestQueue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
@@ -122,6 +123,9 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.PRIORITY
         elif self.scheduler_config.policy == "fcfs":
             self.policy = SchedulingPolicy.FCFS
+        # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling policy
+        elif self.scheduler_config.policy == "isrtf":
+            self.policy = SchedulingPolicy.ISRTF
         else:
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
@@ -213,6 +217,16 @@ class Scheduler(SchedulerInterface):
             self._open_csv_files()
             
             logger.info(f"CSV logging enabled. Logs will be saved to {self.csv_log_dir}")
+        
+        # [NOTE, hyunnnchoi, 2025.12.01] ELIS Predictor initialization
+        # Based on: https://arxiv.org/abs/2505.09142
+        self.elis_predictor = None
+        self.elis_tokenizer = None
+        self.elis_prediction_interval = 50  # Re-predict every 50 tokens
+        self.elis_enabled = self.policy == SchedulingPolicy.ISRTF
+        
+        if self.elis_enabled:
+            self._init_elis_predictor()
 
     def _open_csv_files(self) -> None:
         """Open CSV files for logging. Creates new files or rotates existing ones."""
@@ -290,6 +304,220 @@ class Scheduler(SchedulerInterface):
             )
             self.csv_file_counter += 1
             self._open_csv_files()
+
+    # [NOTE, hyunnnchoi, 2025.12.01] ELIS Predictor methods
+    # Based on: https://arxiv.org/abs/2505.09142
+    def _init_elis_predictor(self) -> None:
+        """Initialize ELIS response length predictor model."""
+        import torch
+        from transformers import AutoTokenizer
+        
+        # Get ELIS config from environment variables
+        elis_checkpoint = os.environ.get(
+            "VLLM_ELIS_CHECKPOINT",
+            "/home/work/hyunmokchoi/ELIS/train/checkpoints/latest_model.pt"
+        )
+        elis_bge_model = os.environ.get(
+            "VLLM_ELIS_BGE_MODEL",
+            "BAAI/bge-base-en-v1.5"
+        )
+        self.elis_prediction_interval = int(os.environ.get(
+            "VLLM_ELIS_PREDICTION_INTERVAL",
+            "50"
+        ))
+        self.elis_max_length = int(os.environ.get(
+            "VLLM_ELIS_MAX_LENGTH",
+            "512"
+        ))
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        logger.info(f"[ELIS] Initializing predictor...")
+        logger.info(f"[ELIS] Checkpoint: {elis_checkpoint}")
+        logger.info(f"[ELIS] BGE model: {elis_bge_model}")
+        logger.info(f"[ELIS] Prediction interval: {self.elis_prediction_interval} tokens")
+        
+        try:
+            # Import ELIS model
+            import sys
+            elis_path = os.environ.get(
+                "VLLM_ELIS_PATH",
+                "/home/work/hyunmokchoi/ELIS"
+            )
+            sys.path.insert(0, os.path.join(elis_path, "train"))
+            from model import ELISPredictor
+            
+            # Initialize model
+            self.elis_predictor = ELISPredictor(
+                bge_model_name=elis_bge_model,
+                hidden_dim=1024,
+                num_layers=8,
+                freeze_bge=True
+            )
+            
+            # Load checkpoint
+            checkpoint = torch.load(elis_checkpoint, map_location=device, weights_only=False)
+            self.elis_predictor.load_state_dict(checkpoint['model_state_dict'])
+            self.elis_predictor = self.elis_predictor.to(device)
+            self.elis_predictor.eval()
+            
+            # Initialize tokenizer
+            self.elis_tokenizer = AutoTokenizer.from_pretrained(elis_bge_model)
+            self.elis_device = device
+            
+            logger.info(f"[ELIS] Predictor initialized successfully on {device}")
+            logger.info(f"[ELIS] Model epoch: {checkpoint.get('epoch', 'N/A')}")
+            
+        except Exception as e:
+            logger.error(f"[ELIS] Failed to initialize predictor: {e}")
+            logger.warning("[ELIS] Falling back to FCFS scheduling")
+            self.elis_enabled = False
+            self.elis_predictor = None
+            self.policy = SchedulingPolicy.FCFS
+            self.waiting = create_request_queue(self.policy)
+
+    def _elis_predict(self, text: str) -> float:
+        """
+        Predict remaining tokens for a given text context.
+        
+        Args:
+            text: Full context (prompt + generated text so far)
+            
+        Returns:
+            Predicted remaining tokens
+        """
+        if self.elis_predictor is None or self.elis_tokenizer is None:
+            return float('inf')
+        
+        import torch
+        
+        try:
+            # Tokenize
+            encoded = self.elis_tokenizer(
+                text,
+                max_length=self.elis_max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            
+            input_ids = encoded['input_ids'].to(self.elis_device)
+            attention_mask = encoded['attention_mask'].to(self.elis_device)
+            
+            # Predict
+            with torch.no_grad():
+                prediction = self.elis_predictor(input_ids, attention_mask)
+            
+            # Clamp to non-negative
+            return max(0.0, prediction.item())
+            
+        except Exception as e:
+            logger.warning(f"[ELIS] Prediction failed: {e}")
+            return float('inf')
+
+    def _elis_update_request_prediction(self, request: Request) -> bool:
+        """
+        Update ELIS prediction for a request if needed.
+        
+        Called every 50 tokens as per ELIS paper.
+        
+        Args:
+            request: Request to update prediction for
+            
+        Returns:
+            True if prediction was updated, False otherwise
+        """
+        if not self.elis_enabled:
+            return False
+        
+        # Check if update is needed (every 50 tokens)
+        tokens_since_last = request.num_output_tokens - request.last_prediction_at_tokens
+        if tokens_since_last < self.elis_prediction_interval:
+            return False
+        
+        # Build full context: prompt + generated text
+        # Note: We need to decode token IDs to text for BGE model
+        try:
+            if self.elis_tokenizer is None:
+                return False
+            
+            # Decode prompt tokens
+            prompt_text = self.elis_tokenizer.decode(
+                request.prompt_token_ids[:self.elis_max_length] if request.prompt_token_ids else [],
+                skip_special_tokens=True
+            )
+            
+            # Decode output tokens
+            output_text = self.elis_tokenizer.decode(
+                request.output_token_ids,
+                skip_special_tokens=True
+            ) if request.output_token_ids else ""
+            
+            # Full context
+            full_context = prompt_text + " " + output_text if output_text else prompt_text
+            
+            # Predict
+            predicted_remaining = self._elis_predict(full_context)
+            
+            # Update request
+            old_prediction = request.predicted_remaining_tokens
+            request.predicted_remaining_tokens = predicted_remaining
+            request.last_prediction_at_tokens = request.num_output_tokens
+            request.prediction_history.append(
+                (request.num_output_tokens, predicted_remaining)
+            )
+            
+            logger.debug(
+                f"[ELIS] Request {request.request_id[:8]}... prediction updated: "
+                f"{old_prediction:.1f} -> {predicted_remaining:.1f} "
+                f"(at {request.num_output_tokens} tokens)"
+            )
+            
+            # Update priority in waiting queue if using ISRTF
+            if isinstance(self.waiting, ISRTFRequestQueue):
+                self.waiting.update_request_priority(request)
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"[ELIS] Failed to update prediction: {e}")
+            return False
+
+    def _elis_initial_prediction(self, request: Request) -> None:
+        """
+        Make initial ELIS prediction for a new request.
+        
+        Args:
+            request: New request to predict for
+        """
+        if not self.elis_enabled:
+            return
+        
+        try:
+            if self.elis_tokenizer is None:
+                return
+            
+            # Decode prompt tokens
+            prompt_text = self.elis_tokenizer.decode(
+                request.prompt_token_ids[:self.elis_max_length] if request.prompt_token_ids else [],
+                skip_special_tokens=True
+            )
+            
+            # Initial prediction (no output yet)
+            predicted_remaining = self._elis_predict(prompt_text)
+            
+            request.predicted_remaining_tokens = predicted_remaining
+            request.last_prediction_at_tokens = 0
+            request.prediction_history.append((0, predicted_remaining))
+            
+            logger.debug(
+                f"[ELIS] Request {request.request_id[:8]}... initial prediction: "
+                f"{predicted_remaining:.1f} tokens"
+            )
+            
+        except Exception as e:
+            logger.warning(f"[ELIS] Failed initial prediction: {e}")
+            request.predicted_remaining_tokens = float('inf')
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1236,6 +1464,10 @@ class Scheduler(SchedulerInterface):
                     # Record first token timestamp
                     if request.first_token_timestamp is None:
                         request.first_token_timestamp = iteration_timestamp_ms
+                
+                # [NOTE, hyunnnchoi, 2025.12.01] ELIS: Update prediction every 50 tokens
+                if self.elis_enabled and not stopped:
+                    self._elis_update_request_prediction(request)
 
             # Stop checking for pooler models.
             pooler_output = None
@@ -1413,6 +1645,10 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        # [NOTE, hyunnnchoi, 2025.12.01] ELIS initial prediction for ISRTF scheduling
+        if self.elis_enabled:
+            self._elis_initial_prediction(request)
+        
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
