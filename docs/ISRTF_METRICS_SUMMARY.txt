@@ -1,0 +1,235 @@
+================================================================================
+                    ISRTF 메트릭 시스템 구현 완료!
+================================================================================
+
+📍 위치: /home/xsailor6/hmchoi
+
+📦 새로 추가된 파일:
+  ├── vllm/vllm/v1/core/sched/isrtf_metrics.py    # 메트릭 트래커 ⭐
+  ├── vllm/tools/analyze_isrtf_metrics.py         # 분석 스크립트 ⭐
+  └── ISRTF_METRICS_GUIDE.md                      # 사용 가이드 ⭐
+
+📝 수정된 파일:
+  └── vllm/vllm/v1/core/sched/scheduler.py        # 메트릭 통합
+
+================================================================================
+                              🎯 측정 메트릭
+================================================================================
+
+1️⃣  예측 정확도 (Prediction Accuracy)
+    ✓ Initial prediction vs Final prediction
+    ✓ Predicted tokens vs Actual tokens
+    ✓ Absolute error & Relative error rate
+    ✓ Prediction update history (50토큰마다)
+
+2️⃣  Kendall's Tau 상관계수
+    ✓ 예측 순서 vs 실제 순서 일치도 (-1 ~ 1)
+    ✓ 100개 요청마다 자동 계산
+    ✓ p-value로 통계적 유의성 검증
+    ✓ 시간에 따른 변화 추적
+
+3️⃣  레이턴시 메트릭
+    ✓ Total latency (도착 ~ 완료)
+    ✓ Queue wait time
+    ✓ Time to First Token (TTFT)
+    ✓ 출력 길이별 latency 분포
+
+================================================================================
+                              📊 출력 파일
+================================================================================
+
+자동 생성되는 CSV 파일:
+  📄 request_metrics.csv       - 요청별 상세 메트릭
+  📄 kendall_tau.csv            - Kendall's tau 시계열
+  📄 prediction_history.csv     - 예측 업데이트 이력
+  📄 summary.json               - 요약 통계
+
+분석 스크립트 출력 (PNG):
+  📊 prediction_accuracy.png    - 예측 정확도 4종 그래프
+  📊 kendall_tau_analysis.png   - Kendall's tau 분석
+  📊 latency_analysis.png       - 레이턴시 분석
+
+================================================================================
+                              🚀 사용 방법
+================================================================================
+
+1️⃣  환경 변수 설정 (옵션):
+
+    export VLLM_ISRTF_METRICS_DIR="/home/xsailor6/hmchoi/isrtf_metrics"
+    export VLLM_ISRTF_DETAILED_LOGGING="true"
+    export VLLM_ISRTF_KENDALL_WINDOW="100"
+
+2️⃣  ISRTF 서버 시작:
+
+    cd /home/xsailor6/hmchoi/vllm-deployments/vanilla-vllm
+    ./vanilla_vllm_isrtf.sh
+
+3️⃣  요청 전송:
+
+    cd /home/xsailor6/hmchoi/vllm/kukt/request_generator
+    python send_to_vllm.py \
+      --model "meta-llama/Llama-3.1-8B" \
+      --input /data/test_prompts.json \
+      --batch-size 10
+
+4️⃣  메트릭 분석:
+
+    cd /home/xsailor6/hmchoi/vllm
+    python tools/analyze_isrtf_metrics.py \
+      --log-dir /home/xsailor6/hmchoi/isrtf_metrics
+
+5️⃣  결과 확인:
+
+    # CSV 파일
+    ls -lh /home/xsailor6/hmchoi/isrtf_metrics/
+    
+    # 그래프
+    eog /home/xsailor6/hmchoi/isrtf_metrics/*.png
+
+================================================================================
+                          📈 Kendall's Tau 해석
+================================================================================
+
+τ = +1    →  완벽히 동일한 순서로 예측 (perfect!) ✓✓✓
+τ > 0.7   →  강한 양의 상관관계 (예측이 매우 정확) ✓✓
+τ > 0.4   →  중간 정도의 양의 상관관계 ✓
+τ > 0.2   →  약한 양의 상관관계
+τ ≈ 0     →  상관관계 없음 (예측 무의미) ✗
+τ = -1    →  정확히 반대 순서로 예측 (worst!) ✗✗✗
+
+의미:
+- τ가 1에 가까울수록: 예측된 토큰 길이 순서가 실제 순서와 일치
+- 즉, SJF (Shortest Job First)를 잘 구현하고 있다는 의미
+- τ가 음수면: 예측이 오히려 역효과 (긴 작업을 먼저 처리)
+- p-value < 0.05면 통계적으로 유의미
+
+예시:
+  Request A: predicted=50,  actual=50   → τ=1 (완벽)
+  Request B: predicted=100, actual=100
+  Request C: predicted=150, actual=150
+  예측 순서: A < B < C
+  실제 순서: A < B < C ✓ 일치!
+  
+  Request A: predicted=50,  actual=150  → τ=-1 (최악)
+  Request B: predicted=100, actual=100
+  Request C: predicted=150, actual=50
+  예측 순서: A < B < C
+  실제 순서: C < B < A ✗ 정반대!
+
+================================================================================
+                          🎯 좋은 결과 기준
+================================================================================
+
+✓ Kendall's tau > 0.6
+✓ Mean prediction error rate < 30%
+✓ Median absolute error < 50 tokens
+✓ P95 latency가 FCFS 대비 낮음
+
+================================================================================
+                          📁 CSV 파일 상세
+================================================================================
+
+request_metrics.csv (12개 컬럼):
+  - request_id, arrival_time, completion_time
+  - total_latency, queue_wait_time, time_to_first_token
+  - initial_prediction, final_prediction
+  - actual_output_tokens
+  - prediction_error, prediction_error_rate
+  - num_prediction_updates
+
+kendall_tau.csv (6개 컬럼):
+  - timestamp, kendall_tau, p_value
+  - sample_size, mean_prediction_error, median_prediction_error
+
+prediction_history.csv (4개 컬럼):
+  - request_id, num_output_tokens
+  - predicted_remaining, timestamp
+
+================================================================================
+                          🔍 빠른 분석 (CLI)
+================================================================================
+
+# CSV 미리보기
+head -20 /tmp/isrtf_metrics/request_metrics.csv
+
+# 요약 통계
+cat /tmp/isrtf_metrics/summary.json | jq
+
+# Python 원라이너
+python -c "
+import pandas as pd
+df = pd.read_csv('/tmp/isrtf_metrics/request_metrics.csv')
+print('Mean error:', df['prediction_error'].mean())
+print('Kendall tau:', df[['final_prediction', 'actual_output_tokens']].corr('kendall'))
+"
+
+================================================================================
+                          💡 주요 기능
+================================================================================
+
+1. 실시간 메트릭 수집
+   - 요청 도착/완료/예측 업데이트 시점마다 자동 로깅
+   - CSV 파일에 실시간 flush (서버 중단해도 데이터 보존)
+
+2. Kendall's Tau 자동 계산
+   - 100개 요청마다 자동으로 상관계수 계산
+   - 시간에 따른 예측 품질 변화 추적
+
+3. 예측 이력 추적
+   - 50토큰마다 예측이 어떻게 변하는지 기록
+   - 예측 정확도가 시간에 따라 개선되는지 분석 가능
+
+4. 자동 시각화
+   - analyze_isrtf_metrics.py로 3개의 고품질 그래프 생성
+   - matplotlib + seaborn 기반 publication-ready 그래프
+
+5. 통계 분석
+   - scipy.stats 사용하여 통계적 유의성 검증
+   - p-value, confidence interval 등 제공
+
+================================================================================
+                          🐛 디버깅
+================================================================================
+
+문제: 메트릭 파일이 생성되지 않음
+해결: 
+  1. sudo docker logs vllm 2>&1 | grep "ISRTF Metrics"
+  2. 디렉토리 권한 확인
+  3. ISRTF 정책이 활성화되었는지 확인
+
+문제: Kendall's tau가 계산되지 않음
+해결:
+  1. 최소 100개 이상의 요청 완료 필요
+  2. kendall_tau.csv 파일 확인
+
+문제: 그래프 생성 실패
+해결:
+  1. matplotlib, seaborn, scipy 설치 확인
+  2. pip install matplotlib seaborn scipy pandas numpy
+
+================================================================================
+                          📚 참고 문서
+================================================================================
+
+ISRTF_METRICS_GUIDE.md  → 상세 사용 가이드 ⭐
+ISRTF_QUICKSTART.md     → 빠른 시작
+ISRTF_TEST_GUIDE.md     → 테스트 가이드
+check_isrtf_status.py   → 구현 상태 확인
+
+================================================================================
+                          ✅ 구현 완료!
+================================================================================
+
+이제 다음을 할 수 있습니다:
+
+1. ✓ 예측 정확도 정량적 평가 (MAE, MAPE, etc.)
+2. ✓ Kendall's tau로 스케줄링 품질 평가
+3. ✓ 예측 vs 실제 순서 일치도 검증
+4. ✓ 레이턴시 개선 효과 측정
+5. ✓ 시간에 따른 성능 변화 추적
+6. ✓ 자동 시각화 및 리포트 생성
+
+모든 메트릭이 자동으로 수집되고, 분석 스크립트 한 번으로 
+완전한 평가 리포트를 생성할 수 있습니다! 🎉
+
+================================================================================

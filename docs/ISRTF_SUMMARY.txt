@@ -1,0 +1,195 @@
+================================================================================
+                     ISRTF + ELIS 예측 모델 테스트 준비 완료
+================================================================================
+
+📍 위치: /home/xsailor6/hmchoi
+
+📦 주요 파일:
+  ├── ISRTF_QUICKSTART.md          # 빠른 시작 가이드 ⭐
+  ├── ISRTF_TEST_GUIDE.md          # 상세 테스트 가이드
+  ├── check_isrtf_status.py        # 구현 상태 확인 스크립트
+  ├── test_isrtf.sh                # FCFS vs ISRTF 비교 테스트
+  ├── vllm-deployments/vanilla-vllm/
+  │   ├── vanilla_vllm.sh          # 기존 FCFS 서버
+  │   └── vanilla_vllm_isrtf.sh    # 새로운 ISRTF 서버 ⭐
+  ├── ELIS/
+  │   └── train/
+  │       ├── checkpoints/
+  │       │   └── latest_model.pt  # 예측 모델 (499MB) ⭐
+  │       └── model.py             # ELISPredictor 클래스
+  └── vllm/
+      ├── vllm/config/scheduler.py           # ISRTF 정책 정의
+      ├── vllm/v1/core/sched/
+      │   ├── scheduler.py                   # ELIS 통합
+      │   └── request_queue.py               # ISRTFRequestQueue
+      ├── vllm/v1/request.py                 # 예측 필드 추가
+      └── kukt/request_generator/
+          └── send_to_vllm.py                # 요청 생성기
+
+================================================================================
+                              🚀 빠른 시작
+================================================================================
+
+1️⃣  상태 확인:
+    python3 check_isrtf_status.py
+
+2️⃣  ISRTF 서버 시작:
+    cd vllm-deployments/vanilla-vllm
+    ./vanilla_vllm_isrtf.sh
+
+3️⃣  새 터미널에서 로그 확인:
+    sudo docker logs -f vllm 2>&1 | grep ELIS
+
+4️⃣  테스트 요청 전송:
+    cd vllm/kukt/request_generator
+    python send_to_vllm.py --batch-size 5
+
+5️⃣  전체 성능 비교 테스트:
+    ./test_isrtf.sh
+
+================================================================================
+                           ✅ 구현 상태 (100%)
+================================================================================
+
+✓ ELIS 예측 모델 체크포인트
+✓ ELIS 모델 코드
+✓ vLLM 스케줄러 ISRTF 정책
+✓ ISRTFRequestQueue 구현
+✓ 스케줄러에 ELIS 예측기 통합
+✓ Request 클래스 수정
+✓ 테스트 스크립트
+✓ Request generator
+
+================================================================================
+                           🔍 주요 변경사항
+================================================================================
+
+커밋 히스토리:
+  262fbddda - Update scheduler and request queue with custom request generator
+  9b8176da9 - Fix tokenizer loading
+  5ded9e9aa - feat: request sender for reimplementing ELIS
+
+주요 구현:
+  1. SchedulerPolicy에 "isrtf" 추가
+  2. ISRTFRequestQueue - predicted_remaining_tokens 기반 우선순위 큐
+  3. ELIS 예측기 초기화 및 통합
+  4. 50토큰마다 자동 예측 업데이트
+  5. Request 클래스에 예측 관련 필드 추가
+
+================================================================================
+                           📊 테스트 방법
+================================================================================
+
+방법 1: 수동 테스트
+  - vanilla_vllm_isrtf.sh로 서버 시작
+  - curl 또는 send_to_vllm.py로 요청 전송
+  - 로그에서 ELIS 예측 동작 확인
+
+방법 2: 자동 비교 테스트
+  - ./test_isrtf.sh 실행
+  - FCFS와 ISRTF 성능 자동 비교
+  - 결과는 ELIS/data/test_results/에 저장
+
+방법 3: 커스텀 테스트
+  - 프롬프트 파일 준비 (JSON)
+  - send_to_vllm.py로 전송
+  - 다양한 길이의 요청으로 ISRTF 효과 검증
+
+================================================================================
+                           🎯 예측 모델 동작
+================================================================================
+
+1. 신규 요청 → 프롬프트로 초기 예측
+2. predicted_remaining_tokens 기반 우선순위 설정
+3. 50토큰 생성마다 예측 업데이트
+4. 우선순위 큐에서 자동 재정렬
+5. 짧은 요청 우선 처리 → latency 최적화
+
+예측 모델:
+  - BGE embeddings (BAAI/bge-base-en-v1.5)
+  - 8 FC layers (1024 hidden dim)
+  - Mean pooling
+  - 출력: 예상 remaining tokens
+
+================================================================================
+                           ⚙️ 환경 변수
+================================================================================
+
+VLLM_ELIS_CHECKPOINT      # 예측 모델 경로
+VLLM_ELIS_BGE_MODEL       # BGE 모델 이름
+VLLM_ELIS_PREDICTION_INTERVAL  # 업데이트 간격 (기본 50)
+VLLM_ELIS_PATH            # ELIS 모듈 경로
+
+서버 실행 플래그:
+  --scheduling-policy isrtf
+  --tensor-parallel-size 4
+  --gpu-memory-utilization 0.8
+
+================================================================================
+                           📈 성능 메트릭
+================================================================================
+
+측정 지표:
+  - Time to First Token (TTFT)
+  - Time Between Tokens (TBT)
+  - Total latency (per request)
+  - Throughput (requests/sec)
+  - P50, P95, P99 latency
+
+로그 분석:
+  - 예측 정확도 (predicted vs actual)
+  - 우선순위 큐 상태
+  - 스케줄링 결정
+
+================================================================================
+                           🐛 디버깅 팁
+================================================================================
+
+1. 서버 안 뜸:
+   sudo docker logs vllm
+
+2. ELIS 안 로드됨:
+   sudo docker exec -it vllm ls /ELIS/train/checkpoints/
+
+3. 예측 안 작동:
+   sudo docker logs vllm 2>&1 | grep "prediction"
+
+4. GPU 메모리 부족:
+   nvidia-smi
+   # gpu-memory-utilization 낮추기
+
+5. 토크나이저 에러:
+   # 모델과 토크나이저 일치 확인
+
+================================================================================
+                           📚 문서
+================================================================================
+
+ISRTF_QUICKSTART.md  → 빠른 시작 (이것부터 읽으세요!)
+ISRTF_TEST_GUIDE.md  → 상세 테스트 가이드
+check_isrtf_status.py → 구현 확인 스크립트
+ELIS/train/model.py  → 예측 모델 구조
+
+ELIS 논문: https://arxiv.org/abs/2505.09142
+
+================================================================================
+                           ✨ 다음 단계
+================================================================================
+
+1. 기본 동작 확인 (check_isrtf_status.py)
+2. ISRTF 서버 실행 및 로그 확인
+3. 간단한 요청 테스트
+4. FCFS vs ISRTF 성능 비교
+5. 예측 정확도 분석
+6. 하이퍼파라미터 튜닝
+7. 대규모 워크로드 테스트
+
+================================================================================
+
+문제가 있으면:
+  1. check_isrtf_status.py로 상태 확인
+  2. ISRTF_TEST_GUIDE.md의 디버깅 섹션 참고
+  3. 로그 상세 분석
+
+준비 완료! 🎉
+
