@@ -32,6 +32,7 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue,
                                               ISRTFRequestQueue)
+from vllm.v1.core.sched.isrtf_metrics import ISRTFMetricsTracker
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
@@ -225,8 +226,11 @@ class Scheduler(SchedulerInterface):
         self.elis_prediction_interval = 50  # Re-predict every 50 tokens
         self.elis_enabled = self.policy == SchedulingPolicy.ISRTF
         
+        # [NOTE, hyunnnchoi, 2025.12.07] ISRTF metrics tracker initialization
+        self.isrtf_metrics_tracker = None
         if self.elis_enabled:
             self._init_elis_predictor()
+            self._init_isrtf_metrics_tracker()
 
     def _open_csv_files(self) -> None:
         """Open CSV files for logging. Creates new files or rotates existing ones."""
@@ -376,6 +380,40 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.FCFS
             self.waiting = create_request_queue(self.policy)
 
+    # [NOTE, hyunnnchoi, 2025.12.07] ISRTF metrics tracker initialization
+    def _init_isrtf_metrics_tracker(self) -> None:
+        """Initialize ISRTF metrics tracker for evaluation."""
+        try:
+            # Get metrics config from environment variables
+            metrics_log_dir = os.environ.get(
+                "VLLM_ISRTF_METRICS_DIR",
+                "/tmp/isrtf_metrics"
+            )
+            enable_detailed_logging = os.environ.get(
+                "VLLM_ISRTF_DETAILED_LOGGING",
+                "true"
+            ).lower() == "true"
+            kendall_tau_window = int(os.environ.get(
+                "VLLM_ISRTF_KENDALL_WINDOW",
+                "100"
+            ))
+            
+            self.isrtf_metrics_tracker = ISRTFMetricsTracker(
+                log_dir=metrics_log_dir,
+                enable_detailed_logging=enable_detailed_logging,
+                kendall_tau_window=kendall_tau_window
+            )
+            
+            logger.info(f"[ISRTF Metrics] Tracker initialized")
+            logger.info(f"[ISRTF Metrics] Log directory: {metrics_log_dir}")
+            logger.info(f"[ISRTF Metrics] Detailed logging: {enable_detailed_logging}")
+            logger.info(f"[ISRTF Metrics] Kendall's tau window: {kendall_tau_window}")
+            
+        except Exception as e:
+            logger.error(f"[ISRTF Metrics] Failed to initialize tracker: {e}")
+            logger.warning("[ISRTF Metrics] Continuing without metrics tracking")
+            self.isrtf_metrics_tracker = None
+
     def _elis_predict(self, text: str) -> float:
         """
         Predict remaining tokens for a given text context.
@@ -473,6 +511,14 @@ class Scheduler(SchedulerInterface):
                 f"(at {request.num_output_tokens} tokens)"
             )
             
+            # [NOTE, hyunnnchoi, 2025.12.07] Track prediction update in metrics
+            if self.isrtf_metrics_tracker:
+                self.isrtf_metrics_tracker.update_prediction(
+                    request_id=request.request_id,
+                    num_output_tokens=request.num_output_tokens,
+                    predicted_remaining=predicted_remaining
+                )
+            
             # Update priority in waiting queue if using ISRTF
             if isinstance(self.waiting, ISRTFRequestQueue):
                 self.waiting.update_request_priority(request)
@@ -514,6 +560,14 @@ class Scheduler(SchedulerInterface):
                 f"[ELIS] Request {request.request_id[:8]}... initial prediction: "
                 f"{predicted_remaining:.1f} tokens"
             )
+            
+            # [NOTE, hyunnnchoi, 2025.12.07] Track initial prediction in metrics
+            if self.isrtf_metrics_tracker:
+                self.isrtf_metrics_tracker.register_request(
+                    request_id=request.request_id,
+                    arrival_time=request.arrival_time,
+                    initial_prediction=predicted_remaining
+                )
             
         except Exception as e:
             logger.warning(f"[ELIS] Failed initial prediction: {e}")
@@ -1794,6 +1848,14 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
+
+        # [NOTE, hyunnnchoi, 2025.12.07] Track request completion in metrics
+        if self.isrtf_metrics_tracker and self.elis_enabled:
+            self.isrtf_metrics_tracker.complete_request(
+                request_id=request.request_id,
+                completion_time=time.time(),
+                actual_output_tokens=request.num_output_tokens
+            )
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
