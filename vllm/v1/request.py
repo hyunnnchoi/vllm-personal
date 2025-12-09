@@ -132,6 +132,12 @@ class Request:
         self.predicted_remaining_tokens: float = float('inf')  # Initial: infinity (unknown)
         self.last_prediction_at_tokens: int = 0  # Last prediction was made at this token count
         self.prediction_history: list[tuple[int, float]] = []  # (token_count, predicted_remaining)
+        
+        # [NOTE, Jaehoon, 2025.12.09] LTR: Learning to Rank scheduling fields
+        self.score: float = 0.0  # Predictor score for request prioritization
+        self.promote: bool = False  # Starvation prevention flag
+        self.starvation: int = 0  # Number of scheduling iterations waiting
+        self.quantum: Optional[int] = None  # Remaining scheduling cycles in priority mode
 
     @classmethod
     def from_engine_core_request(

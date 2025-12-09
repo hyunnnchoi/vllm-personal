@@ -609,8 +609,10 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        # ltr scheduling
-        sorted_requests = sorted(self.waiting.requests + self.running, key=lambda req: (req.promote, req.score), reverse=True)
+        # [NOTE, Jaehoon, 2025.12.09] LTR scheduling uses different logic
+        if self.policy == SchedulingPolicy.LTR:
+            # LTR scheduling: sort by (promote, score)
+            sorted_requests = sorted(self.waiting.requests + self.running, key=lambda req: (req.promote, req.score), reverse=True)
         prev_run = filter(lambda req: req.status == RequestStatus.RUNNING, sorted_requests)
         new_run = []
         can_schedule = True

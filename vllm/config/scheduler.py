@@ -20,7 +20,8 @@ logger = init_logger(__name__)
 RunnerType = Literal["generate", "pooling", "draft"]
 # [NOTE, hyunnnchoi, 2025.12.01] Added "isrtf" for ELIS scheduling
 # Based on: https://arxiv.org/abs/2505.09142
-SchedulerPolicy = Literal["fcfs", "priority", "isrtf"]
+# [NOTE, merge J, 2025.12.09] Added "ltr" for Learning to Rank scheduling
+SchedulerPolicy = Literal["fcfs", "priority", "isrtf", "ltr"]
 
 
 @config
@@ -114,7 +115,9 @@ class SchedulerConfig:
     value means earlier handling) and time of arrival deciding any ties).\n
     - "isrtf" means Iterative Shortest Remaining Time First, using ELIS
     (https://arxiv.org/abs/2505.09142) to predict remaining tokens and
-    prioritize requests with fewer predicted remaining tokens."""
+    prioritize requests with fewer predicted remaining tokens.\n
+    - "ltr" means Learning to Rank, using a trained predictor model to score
+    and prioritize requests based on predicted performance."""
 
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
