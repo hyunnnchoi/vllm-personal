@@ -50,8 +50,13 @@ class LTRScheduler(Scheduler):
         include_finished_set: bool = False,
         log_stats: bool = False,
     ) -> None:
-        # Initialize base scheduler (FCFS/Priority/ISRTF logic)
-        # But we'll override the policy to LTR
+        # [NOTE, hyunnnchoi, 2025.12.09] Temporarily set policy to FCFS for base init
+        # The base Scheduler doesn't know about LTR policy, so we use FCFS as a valid
+        # placeholder during initialization, then override to LTR afterwards.
+        original_policy = vllm_config.scheduler_config.policy
+        vllm_config.scheduler_config.policy = "fcfs"
+        
+        # Initialize base scheduler with FCFS policy
         super().__init__(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -61,8 +66,14 @@ class LTRScheduler(Scheduler):
             log_stats=log_stats,
         )
         
-        # Override policy to LTR
+        # Restore original policy and override to LTR
+        vllm_config.scheduler_config.policy = original_policy
         self.policy = SchedulingPolicy.LTR
+        
+        # Recreate waiting queue with LTR policy
+        # (base init created FCFS queue, we need LTR queue)
+        from vllm.v1.core.sched.request_queue import create_request_queue
+        self.waiting = create_request_queue(self.policy)
         
         # [NOTE, hyunnnchoi, 2025.12.09] Initialize LTR predictor
         predictor_path = os.environ.get("VLLM_LTR_PREDICTOR_PATH")
