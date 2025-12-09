@@ -8,17 +8,24 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
+from typing import Optional
 
 from vllm.v1.request import Request
+
+from vllm.v1.core.sched.predictor import LTRPredictor
 
 
 class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
     FCFS = "fcfs"
     PRIORITY = "priority"
+<<<<<<< HEAD
     # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling policy
     # Based on: https://arxiv.org/abs/2505.09142
     ISRTF = "isrtf"
+=======
+    LTR="ltr"
+>>>>>>> 40f1b4311 (feat: implement learning to rank scheduling with LTRRequestQueue and LTRPredictor)
 
 
 class RequestQueue(ABC):
@@ -217,6 +224,7 @@ class PriorityRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
+<<<<<<< HEAD
 # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF Request Queue
 # Based on: https://arxiv.org/abs/2505.09142
 class ISRTFRequestQueue(RequestQueue):
@@ -344,7 +352,59 @@ class ISRTFRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+# [NOTE, Jaehoon, 2025.12.01] LTR Request Queue
+class LTRRequestQueue(RequestQueue):
+    """
+    Learning-To-Rank 기반 policy queue.
+    """
+    def __init__(self, model: str, predictor_model_path: str) -> None:
+        self.requests: list[Request] = []
+        self.predictor = LTRPredictor(model, predictor_model_path)
+
+    def add_request(self, request: Request) -> None:
+        request.promote = False
+        request.starvation = 0
+        request.quantum = None
+        request.score = self.predictor.get_score(request.prompt_token_ids)
+        self.requests.append(request)
+
+    def pop_request(self) -> Request:
+        raise NotImplementedError
+
+    def peek_request(self) -> Request:
+        raise NotImplementedError
+
+    def prepend_request(self, request: Request) -> None:
+        raise NotImplementedError
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        raise NotImplementedError
+
+    def remove_request(self, request: Request) -> None:
+        raise NotImplementedError
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        print("Error")
+        raise NotImplementedError
+
+    def __bool__(self) -> bool:
+        return bool(self.requests)
+
+    def __len__(self) -> int:
+        return len(self.requests)
+
+    def __iter__(self) -> Iterator[Request]:
+        return iter(self.requests)
+
+    def __reversed__(self) -> Iterator[Request]:
+        return reversed(self.requests)
+
+
+def create_request_queue(
+    policy: SchedulingPolicy, 
+    model: Optional[str] = None, 
+    predictor_model_path: Optional[str] = None
+) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
@@ -353,5 +413,10 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling
     elif policy == SchedulingPolicy.ISRTF:
         return ISRTFRequestQueue()
+    # [NOTE, Jaehoon, 2025.12.01] LTR scheduling
+    elif policy == SchedulingPolicy.LTR:
+        if model is None or predictor_model_path is None:
+            raise ValueError("Model and predictor_model_path must be provided for LTR policy.")
+        return LTRRequestQueue(model, predictor_model_path)
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
