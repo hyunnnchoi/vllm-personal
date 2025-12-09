@@ -19,13 +19,11 @@ class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
     FCFS = "fcfs"
     PRIORITY = "priority"
-<<<<<<< HEAD
     # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling policy
     # Based on: https://arxiv.org/abs/2505.09142
     ISRTF = "isrtf"
-=======
-    LTR="ltr"
->>>>>>> 40f1b4311 (feat: implement learning to rank scheduling with LTRRequestQueue and LTRPredictor)
+    # [NOTE, Jaehoon, 2025.12.01] LTR scheduling policy
+    LTR = "ltr"
 
 
 class RequestQueue(ABC):
@@ -224,7 +222,6 @@ class PriorityRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
-<<<<<<< HEAD
 # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF Request Queue
 # Based on: https://arxiv.org/abs/2505.09142
 class ISRTFRequestQueue(RequestQueue):
