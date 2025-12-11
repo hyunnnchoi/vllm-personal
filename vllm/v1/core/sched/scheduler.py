@@ -45,6 +45,124 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
 
+# [NOTE, hyunnnchoi, 2025.12.11] HOL Blocking tracking
+class HOLBlockingTracker:
+    """Tracks Head-of-Line blocking events for scheduling analysis."""
+    
+    def __init__(self, log_dir: str = "./hol_blocking_logs"):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # CSV file for detailed request tracking
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.csv_path = os.path.join(log_dir, f"hol_blocking_{timestamp}.csv")
+        
+        # Request tracking data
+        self.request_data: dict[str, dict] = {}
+        self.scheduling_step = 0
+        
+        # Initialize CSV file
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'scheduling_step',
+                'request_id',
+                'arrival_time',
+                'queue_enter_time',
+                'scheduled_time',
+                'finish_time',
+                'queue_position',
+                'num_waiting_requests',
+                'event_type',  # 'queued', 'blocking', 'scheduled', 'finished'
+                'blocking_reason',  # 'kv_cache_full', 'token_budget', 'max_running', 'encoder', etc.
+                'token_budget_remaining',
+                'num_running_requests',
+                'wait_duration_ms',
+            ])
+        logger.info(f"HOL Blocking tracker initialized. Log file: {self.csv_path}")
+    
+    def record_request_queued(self, request_id: str, arrival_time: float):
+        """Record when a request enters the waiting queue."""
+        if request_id not in self.request_data:
+            self.request_data[request_id] = {
+                'arrival_time': arrival_time,
+                'queue_enter_time': arrival_time,
+                'scheduled_time': None,
+                'finish_time': None,
+            }
+    
+    def record_scheduling_attempt(
+        self,
+        request_id: str,
+        queue_position: int,
+        num_waiting: int,
+        event_type: str,
+        blocking_reason: str = '',
+        token_budget: int = 0,
+        num_running: int = 0,
+    ):
+        """Record a scheduling event (blocking or successful scheduling)."""
+        current_time = time.time()
+        req_data = self.request_data.get(request_id, {})
+        
+        queue_enter_time = req_data.get('queue_enter_time', current_time)
+        wait_duration_ms = (current_time - queue_enter_time) * 1000
+        
+        if event_type == 'scheduled':
+            self.request_data[request_id]['scheduled_time'] = current_time
+        
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                self.scheduling_step,
+                request_id,
+                req_data.get('arrival_time', ''),
+                queue_enter_time,
+                req_data.get('scheduled_time', ''),
+                req_data.get('finish_time', ''),
+                queue_position,
+                num_waiting,
+                event_type,
+                blocking_reason,
+                token_budget,
+                num_running,
+                f"{wait_duration_ms:.2f}",
+            ])
+    
+    def record_request_finished(self, request_id: str):
+        """Record when a request finishes."""
+        if request_id in self.request_data:
+            self.request_data[request_id]['finish_time'] = time.time()
+            
+            # Write final entry
+            req_data = self.request_data[request_id]
+            with open(self.csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                total_duration_ms = (
+                    (req_data['finish_time'] - req_data['arrival_time']) * 1000
+                    if req_data.get('finish_time') and req_data.get('arrival_time')
+                    else 0
+                )
+                writer.writerow([
+                    self.scheduling_step,
+                    request_id,
+                    req_data.get('arrival_time', ''),
+                    req_data.get('queue_enter_time', ''),
+                    req_data.get('scheduled_time', ''),
+                    req_data.get('finish_time', ''),
+                    -1,  # queue_position (not in queue anymore)
+                    0,   # num_waiting
+                    'finished',
+                    '',  # blocking_reason
+                    0,   # token_budget
+                    0,   # num_running
+                    f"{total_duration_ms:.2f}",
+                ])
+    
+    def next_step(self):
+        """Increment scheduling step counter."""
+        self.scheduling_step += 1
+
 
 class Scheduler(SchedulerInterface):
 
@@ -231,6 +349,16 @@ class Scheduler(SchedulerInterface):
         if self.elis_enabled:
             self._init_elis_predictor()
             self._init_isrtf_metrics_tracker()
+        
+        # [NOTE, hyunnnchoi, 2025.12.11] HOL Blocking tracker initialization
+        hol_tracking_enabled = os.environ.get("VLLM_HOL_TRACKING", "0") == "1"
+        self.hol_tracker: Optional[HOLBlockingTracker] = None
+        if hol_tracking_enabled:
+            hol_log_dir = os.environ.get(
+                "VLLM_HOL_LOG_DIR", "./hol_blocking_logs"
+            )
+            self.hol_tracker = HOLBlockingTracker(log_dir=hol_log_dir)
+            logger.info(f"HOL Blocking tracking enabled. Logs: {hol_log_dir}")
 
     def _open_csv_files(self) -> None:
         """Open CSV files for logging. Creates new files or rotates existing ones."""
@@ -585,6 +713,10 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # [NOTE, hyunnnchoi, 2025.12.11] Increment HOL tracking step
+        if self.hol_tracker is not None:
+            self.hol_tracker.next_step()
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -732,6 +864,18 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    # [NOTE, hyunnnchoi, 2025.12.11] Track HOL blocking due to max_running_reqs
+                    if self.hol_tracker is not None:
+                        for idx, req in enumerate(self.waiting):
+                            self.hol_tracker.record_scheduling_attempt(
+                                request_id=req.request_id,
+                                queue_position=idx,
+                                num_waiting=len(self.waiting),
+                                event_type='blocking',
+                                blocking_reason='max_running_reqs',
+                                token_budget=token_budget,
+                                num_running=len(self.running),
+                            )
                     break
 
                 request = self.waiting.peek_request()
@@ -827,6 +971,23 @@ class Scheduler(SchedulerInterface):
                     # pooling requests to be chunked
                     if not self.scheduler_config.chunked_prefill_enabled and \
                         num_new_tokens > token_budget:
+                        # [NOTE, hyunnnchoi, 2025.12.11] Track HOL blocking due to token budget
+                        if self.hol_tracker is not None:
+                            # Get current queue position
+                            queue_pos = 0
+                            for idx, req in enumerate(self.waiting):
+                                if req.request_id == request.request_id:
+                                    queue_pos = idx
+                                    break
+                            self.hol_tracker.record_scheduling_attempt(
+                                request_id=request.request_id,
+                                queue_position=queue_pos,
+                                num_waiting=len(self.waiting),
+                                event_type='blocking',
+                                blocking_reason='token_budget_insufficient',
+                                token_budget=token_budget,
+                                num_running=len(self.running),
+                            )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -842,6 +1003,22 @@ class Scheduler(SchedulerInterface):
                              request, num_computed_tokens, num_new_tokens,
                              encoder_compute_budget)
                         if num_new_tokens == 0:
+                            # [NOTE, hyunnnchoi, 2025.12.11] Track HOL blocking due to encoder
+                            if self.hol_tracker is not None:
+                                queue_pos = 0
+                                for idx, req in enumerate(self.waiting):
+                                    if req.request_id == request.request_id:
+                                        queue_pos = idx
+                                        break
+                                self.hol_tracker.record_scheduling_attempt(
+                                    request_id=request.request_id,
+                                    queue_position=queue_pos,
+                                    num_waiting=len(self.waiting),
+                                    event_type='blocking',
+                                    blocking_reason='encoder_budget_insufficient',
+                                    token_budget=token_budget,
+                                    num_running=len(self.running),
+                                )
                             # The request cannot be scheduled.
                             break
 
@@ -876,6 +1053,35 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
+                    # [NOTE, hyunnnchoi, 2025.12.11] Track HOL blocking due to KV cache exhaustion
+                    # This is the most critical HOL blocking scenario
+                    if self.hol_tracker is not None:
+                        queue_pos = 0
+                        for idx, req in enumerate(self.waiting):
+                            if req.request_id == request.request_id:
+                                queue_pos = idx
+                                break
+                        self.hol_tracker.record_scheduling_attempt(
+                            request_id=request.request_id,
+                            queue_position=queue_pos,
+                            num_waiting=len(self.waiting),
+                            event_type='blocking',
+                            blocking_reason='kv_cache_full',
+                            token_budget=token_budget,
+                            num_running=len(self.running),
+                        )
+                        # Track all waiting requests behind this one as indirectly blocked
+                        for idx, blocked_req in enumerate(self.waiting):
+                            if blocked_req.request_id != request.request_id:
+                                self.hol_tracker.record_scheduling_attempt(
+                                    request_id=blocked_req.request_id,
+                                    queue_position=idx,
+                                    num_waiting=len(self.waiting),
+                                    event_type='blocking',
+                                    blocking_reason='blocked_by_hol',
+                                    token_budget=token_budget,
+                                    num_running=len(self.running),
+                                )
                     # The request cannot be scheduled.
                     break
 
@@ -905,6 +1111,19 @@ class Scheduler(SchedulerInterface):
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
+                
+                # [NOTE, hyunnnchoi, 2025.12.11] Track successful scheduling
+                if self.hol_tracker is not None:
+                    self.hol_tracker.record_scheduling_attempt(
+                        request_id=request.request_id,
+                        queue_position=-1,  # No longer in queue
+                        num_waiting=len(self.waiting),
+                        event_type='scheduled',
+                        blocking_reason='',
+                        token_budget=token_budget,
+                        num_running=len(self.running),
+                    )
+                
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
@@ -1707,6 +1926,12 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+        
+        # [NOTE, hyunnnchoi, 2025.12.11] Track request queuing for HOL blocking analysis
+        if self.hol_tracker is not None:
+            self.hol_tracker.record_request_queued(
+                request.request_id, time.time()
+            )
 
     def finish_requests(
         self,
@@ -1856,6 +2081,10 @@ class Scheduler(SchedulerInterface):
                 completion_time=time.time(),
                 actual_output_tokens=request.num_output_tokens
             )
+        
+        # [NOTE, hyunnnchoi, 2025.12.11] Track request completion for HOL blocking analysis
+        if self.hol_tracker is not None:
+            self.hol_tracker.record_request_finished(request.request_id)
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
