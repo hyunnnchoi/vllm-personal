@@ -127,6 +127,11 @@ class Request:
         self.decode_step_timings: list[tuple[int, float, int]] = []
         self.first_token_timestamp: Optional[float] = None
         
+        # NOTE, hyunnnchoi, 2025.12.23: Track scheduling timings for accurate metrics
+        self.first_scheduled_time: Optional[float] = None  # First time scheduled (monotonic)
+        self.total_execution_time_ms: float = 0.0  # Total time spent in GPU execution
+        self.scheduled_iterations: list[tuple[float, float]] = []  # (start_time, duration_ms)
+        
         # [NOTE, hyunnnchoi, 2025.12.01] ELIS: Predicted remaining tokens for ISRTF scheduling
         # Based on: https://arxiv.org/abs/2505.09142
         self.predicted_remaining_tokens: float = float('inf')  # Initial: infinity (unknown)

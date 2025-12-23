@@ -359,6 +359,9 @@ class Scheduler(SchedulerInterface):
             )
             self.hol_tracker = HOLBlockingTracker(log_dir=hol_log_dir)
             logger.info(f"HOL Blocking tracking enabled. Logs: {hol_log_dir}")
+        
+        # NOTE, hyunnnchoi, 2025.12.23: Track iteration timing for execution time calculation
+        self._last_iteration_start_time = time.monotonic()
 
     def _open_csv_files(self) -> None:
         """Open CSV files for logging. Creates new files or rotates existing ones."""
@@ -732,7 +735,9 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         # For logging.
-        scheduled_timestamp = time.monotonic()
+        # NOTE, hyunnnchoi, 2025.12.23: Track iteration timing for accurate execution time
+        iteration_start_time = time.monotonic()
+        scheduled_timestamp = iteration_start_time
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1426,6 +1431,9 @@ class Scheduler(SchedulerInterface):
                 self.csv_rows_written += request_rows_written
                 self.iteration_counter += 1
 
+        # NOTE, hyunnnchoi, 2025.12.23: Save iteration start time for execution time tracking
+        self._last_iteration_start_time = iteration_start_time
+        
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -1433,6 +1441,10 @@ class Scheduler(SchedulerInterface):
         self,
         scheduler_output: SchedulerOutput,
     ) -> None:
+        # NOTE, hyunnnchoi, 2025.12.23: Calculate iteration execution time
+        iteration_end_time = time.monotonic()
+        iteration_duration_ms = (iteration_end_time - self._last_iteration_start_time) * 1000.0
+        
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1445,6 +1457,17 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            
+            # NOTE, hyunnnchoi, 2025.12.23: Track first scheduled time and execution time
+            if request.first_scheduled_time is None:
+                request.first_scheduled_time = self._last_iteration_start_time
+            
+            # Accumulate execution time for this iteration
+            request.total_execution_time_ms += iteration_duration_ms
+            request.scheduled_iterations.append(
+                (self._last_iteration_start_time, iteration_duration_ms)
+            )
+            
             request.num_computed_tokens += num_scheduled_token
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
@@ -2004,13 +2027,40 @@ class Scheduler(SchedulerInterface):
             "%Y-%m-%d %H:%M:%S.%f"
         )
         
+        # NOTE, hyunnnchoi, 2025.12.23: Calculate accurate waiting and execution times
+        waiting_time_ms = None
+        if request.first_scheduled_time is not None:
+            # arrival_time is in seconds (Unix timestamp), convert to monotonic time equivalent
+            # We use first_scheduled_time (monotonic) - arrival_time converted to monotonic scale
+            # Since we can't directly convert, we calculate from the first token timestamp
+            waiting_time_ms = (request.first_scheduled_time - 
+                             (request.arrival_time - time.time() + time.monotonic())) * 1000.0
+            # Simplified: use the time difference from arrival to first schedule
+            if request.first_token_timestamp:
+                # More accurate: waiting time is TTFT minus execution time
+                ttft_ms = request.first_token_timestamp - request.arrival_time * 1000.0
+                # Find execution time up to first token
+                first_token_exec_time = 0.0
+                for sched_time, duration in request.scheduled_iterations:
+                    if request.first_token_timestamp and sched_time * 1000.0 < request.first_token_timestamp:
+                        first_token_exec_time += duration
+                    else:
+                        break
+                waiting_time_ms = max(0.0, ttft_ms - first_token_exec_time)
+        
+        execution_time_ms = request.total_execution_time_ms
+        
         # Prepare data
         timings_data = {
             "request_id": request.request_id,
             "arrival_time_unix": arrival_time_unix,
             "arrival_time_str": arrival_time_str,
             "arrival_time_ms": arrival_time_unix * 1000.0,
+            "first_scheduled_time_monotonic": request.first_scheduled_time,
             "first_token_timestamp_ms": request.first_token_timestamp,
+            "waiting_time_ms": waiting_time_ms,
+            "execution_time_ms": execution_time_ms,
+            "num_scheduled_iterations": len(request.scheduled_iterations),
             "num_prompt_tokens": request.num_prompt_tokens,
             "num_output_tokens": len(request.output_token_ids),
             "decode_steps": [
@@ -2021,6 +2071,14 @@ class Scheduler(SchedulerInterface):
                     "time_since_arrival_ms": timestamp_ms - arrival_time_unix * 1000.0,
                 }
                 for token_id, timestamp_ms, token_idx in request.decode_step_timings
+            ],
+            "scheduled_iterations": [
+                {
+                    "iteration_index": i,
+                    "start_time_monotonic": start_time,
+                    "duration_ms": duration_ms
+                }
+                for i, (start_time, duration_ms) in enumerate(request.scheduled_iterations)
             ]
         }
         
@@ -2041,6 +2099,10 @@ class Scheduler(SchedulerInterface):
             timings_data["statistics"] = {
                 "time_to_first_token_ms": time_to_first_token_ms,
                 "total_generation_time_ms": total_time_ms,
+                "waiting_time_ms": waiting_time_ms,
+                "execution_time_ms": execution_time_ms,
+                "execution_ratio": (execution_time_ms / total_time_ms * 100.0 
+                                   if total_time_ms > 0 else None),
                 "inter_token_latencies_ms": inter_token_latencies,
                 "avg_inter_token_latency_ms": (
                     sum(inter_token_latencies) / len(inter_token_latencies)
@@ -2066,6 +2128,14 @@ class Scheduler(SchedulerInterface):
         with open(filename, "w") as f:
             json.dump(timings_data, f, indent=2)
         
+        # NOTE, hyunnnchoi, 2025.12.23: Log waiting and execution times
+        logger.info(
+            f"Request {request.request_id} completed: "
+            f"waiting_time={waiting_time_ms:.2f}ms, "
+            f"execution_time={execution_time_ms:.2f}ms, "
+            f"scheduled_iterations={len(request.scheduled_iterations)}, "
+            f"output_tokens={len(request.output_token_ids)}"
+        )
         logger.info(
             f"Saved decode timings for request {request.request_id} "
             f"({len(request.decode_step_timings)} tokens) to {filename}"
