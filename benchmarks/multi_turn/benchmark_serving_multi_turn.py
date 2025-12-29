@@ -683,18 +683,26 @@ async def client_main(
                     active_convs.pop(conv_id)
 
             except asyncio.exceptions.TimeoutError:
+                # NOTE, hyunnnchoi, 2025.12.28
+                # Timeout 발생 시 클라이언트를 종료하지 않고 해당 conversation만 제거하고 계속 진행
                 num_failures += 1
                 logger.exception(
                     f"{Color.RED}Client {client_id} - Timeout during conversation ID {conv_id} (turn: {current_turn}){Color.RESET}"  # noqa: E501
                 )
-                break  # Exit gracefully instead of raising an error
+                # Remove the conversation and continue with next one
+                active_convs.pop(conv_id, None)
+                # break  # Exit gracefully instead of raising an error
 
             except Exception:
+                # NOTE, hyunnnchoi, 2025.12.28
+                # Exception 발생 시 클라이언트를 종료하지 않고 해당 conversation만 제거하고 계속 진행
                 num_failures += 1
                 logger.exception(
                     f"{Color.RED}Client {client_id} - Exception during conversation ID {conv_id} (turn: {current_turn}){Color.RESET}"  # noqa: E501
                 )
-                break  # Exit gracefully instead of raising an error
+                # Remove the conversation and continue with next one
+                active_convs.pop(conv_id, None)
+                # break  # Exit gracefully instead of raising an error
 
             if success:
                 num_successes += 1
