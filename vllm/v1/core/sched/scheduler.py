@@ -14,28 +14,40 @@ from typing import Any, Optional, Union
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
-from vllm.distributed.kv_transfer.kv_connector.factory import (
-    KVConnectorFactory)
-from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
-                                                          KVConnectorRole)
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.v1 import (
+    KVConnectorBase_V1,
+    KVConnectorRole,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
-    KVConnectorStats)
+    KVConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.transformers_utils.tokenizer import init_tokenizer_from_configs
-from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
-                                                compute_encoder_budget)
+from vllm.v1.core.encoder_cache_manager import (
+    EncoderCacheManager,
+    compute_encoder_budget,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
-from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
-                                       SchedulerOutput)
-from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
-                                              create_request_queue,
-                                              ISRTFRequestQueue)
 from vllm.v1.core.sched.isrtf_metrics import ISRTFMetricsTracker
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
+from vllm.v1.core.sched.request_queue import (
+    ISRTFRequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
-                            EngineCoreOutputs)
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -45,127 +57,136 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 logger = init_logger(__name__)
 
+
 # [NOTE, hyunnnchoi, 2025.12.11] HOL Blocking tracking
 class HOLBlockingTracker:
     """Tracks Head-of-Line blocking events for scheduling analysis."""
-    
+
     def __init__(self, log_dir: str = "./hol_blocking_logs"):
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
-        
+
         # CSV file for detailed request tracking
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.csv_path = os.path.join(log_dir, f"hol_blocking_{timestamp}.csv")
-        
+
         # Request tracking data
         self.request_data: dict[str, dict] = {}
         self.scheduling_step = 0
-        
+
         # Initialize CSV file
-        with open(self.csv_path, 'w', newline='') as f:
+        with open(self.csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                'scheduling_step',
-                'request_id',
-                'arrival_time',
-                'queue_enter_time',
-                'scheduled_time',
-                'finish_time',
-                'queue_position',
-                'num_waiting_requests',
-                'event_type',  # 'queued', 'blocking', 'scheduled', 'finished'
-                'blocking_reason',  # 'kv_cache_full', 'token_budget', 'max_running', 'encoder', etc.
-                'token_budget_remaining',
-                'num_running_requests',
-                'wait_duration_ms',
-            ])
-        logger.info(f"HOL Blocking tracker initialized. Log file: {self.csv_path}")
-    
+            writer.writerow(
+                [
+                    "scheduling_step",
+                    "request_id",
+                    "arrival_time",
+                    "queue_enter_time",
+                    "scheduled_time",
+                    "finish_time",
+                    "queue_position",
+                    "num_waiting_requests",
+                    "event_type",  # 'queued', 'blocking', 'scheduled', 'finished'
+                    "blocking_reason",  # 'kv_cache_full', 'token_budget', 'max_running', 'encoder', etc.
+                    "token_budget_remaining",
+                    "num_running_requests",
+                    "wait_duration_ms",
+                ]
+            )
+        logger.info(
+            f"HOL Blocking tracker initialized. Log file: {self.csv_path}"
+        )
+
     def record_request_queued(self, request_id: str, arrival_time: float):
         """Record when a request enters the waiting queue."""
         if request_id not in self.request_data:
             self.request_data[request_id] = {
-                'arrival_time': arrival_time,
-                'queue_enter_time': arrival_time,
-                'scheduled_time': None,
-                'finish_time': None,
+                "arrival_time": arrival_time,
+                "queue_enter_time": arrival_time,
+                "scheduled_time": None,
+                "finish_time": None,
             }
-    
+
     def record_scheduling_attempt(
         self,
         request_id: str,
         queue_position: int,
         num_waiting: int,
         event_type: str,
-        blocking_reason: str = '',
+        blocking_reason: str = "",
         token_budget: int = 0,
         num_running: int = 0,
     ):
         """Record a scheduling event (blocking or successful scheduling)."""
         current_time = time.time()
         req_data = self.request_data.get(request_id, {})
-        
-        queue_enter_time = req_data.get('queue_enter_time', current_time)
+
+        queue_enter_time = req_data.get("queue_enter_time", current_time)
         wait_duration_ms = (current_time - queue_enter_time) * 1000
-        
-        if event_type == 'scheduled':
-            self.request_data[request_id]['scheduled_time'] = current_time
-        
-        with open(self.csv_path, 'a', newline='') as f:
+
+        if event_type == "scheduled":
+            self.request_data[request_id]["scheduled_time"] = current_time
+
+        with open(self.csv_path, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                self.scheduling_step,
-                request_id,
-                req_data.get('arrival_time', ''),
-                queue_enter_time,
-                req_data.get('scheduled_time', ''),
-                req_data.get('finish_time', ''),
-                queue_position,
-                num_waiting,
-                event_type,
-                blocking_reason,
-                token_budget,
-                num_running,
-                f"{wait_duration_ms:.2f}",
-            ])
-    
+            writer.writerow(
+                [
+                    self.scheduling_step,
+                    request_id,
+                    req_data.get("arrival_time", ""),
+                    queue_enter_time,
+                    req_data.get("scheduled_time", ""),
+                    req_data.get("finish_time", ""),
+                    queue_position,
+                    num_waiting,
+                    event_type,
+                    blocking_reason,
+                    token_budget,
+                    num_running,
+                    f"{wait_duration_ms:.2f}",
+                ]
+            )
+
     def record_request_finished(self, request_id: str):
         """Record when a request finishes."""
         if request_id in self.request_data:
-            self.request_data[request_id]['finish_time'] = time.time()
-            
+            self.request_data[request_id]["finish_time"] = time.time()
+
             # Write final entry
             req_data = self.request_data[request_id]
-            with open(self.csv_path, 'a', newline='') as f:
+            with open(self.csv_path, "a", newline="") as f:
                 writer = csv.writer(f)
                 total_duration_ms = (
-                    (req_data['finish_time'] - req_data['arrival_time']) * 1000
-                    if req_data.get('finish_time') and req_data.get('arrival_time')
+                    (req_data["finish_time"] - req_data["arrival_time"]) * 1000
+                    if req_data.get("finish_time")
+                    and req_data.get("arrival_time")
                     else 0
                 )
-                writer.writerow([
-                    self.scheduling_step,
-                    request_id,
-                    req_data.get('arrival_time', ''),
-                    req_data.get('queue_enter_time', ''),
-                    req_data.get('scheduled_time', ''),
-                    req_data.get('finish_time', ''),
-                    -1,  # queue_position (not in queue anymore)
-                    0,   # num_waiting
-                    'finished',
-                    '',  # blocking_reason
-                    0,   # token_budget
-                    0,   # num_running
-                    f"{total_duration_ms:.2f}",
-                ])
-    
+                writer.writerow(
+                    [
+                        self.scheduling_step,
+                        request_id,
+                        req_data.get("arrival_time", ""),
+                        req_data.get("queue_enter_time", ""),
+                        req_data.get("scheduled_time", ""),
+                        req_data.get("finish_time", ""),
+                        -1,  # queue_position (not in queue anymore)
+                        0,  # num_waiting
+                        "finished",
+                        "",  # blocking_reason
+                        0,  # token_budget
+                        0,  # num_running
+                        f"{total_duration_ms:.2f}",
+                    ]
+                )
+
     def next_step(self):
         """Increment scheduling step counter."""
         self.scheduling_step += 1
 
 
 class Scheduler(SchedulerInterface):
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -191,16 +212,19 @@ class Scheduler(SchedulerInterface):
         # by update_from_outputs(). This is currently used in the multi-engine
         # case to track request lifetimes efficiently.
         self.finished_req_ids_dict: Optional[dict[int, set[str]]] = (
-            defaultdict(set) if include_finished_set else None)
+            defaultdict(set) if include_finished_set else None
+        )
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
-        self.max_num_scheduled_tokens = \
+        self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_batched_tokens
+        )
         self.max_model_len = self.scheduler_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
-            and self.kv_events_config.enable_kv_cache_events)
+            and self.kv_events_config.enable_kv_cache_events
+        )
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -209,12 +233,15 @@ class Scheduler(SchedulerInterface):
         if self.vllm_config.kv_transfer_config is not None:
             assert len(self.kv_cache_config.kv_cache_groups) == 1, (
                 "Multiple KV cache groups are not currently supported "
-                "with KV connectors")
+                "with KV connectors"
+            )
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported "
-                "with KV connectors")
+                "with KV connectors"
+            )
             self.connector = KVConnectorFactory.create_connector(
-                config=self.vllm_config, role=KVConnectorRole.SCHEDULER)
+                config=self.vllm_config, role=KVConnectorRole.SCHEDULER
+            )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -226,8 +253,9 @@ class Scheduler(SchedulerInterface):
 
         self.block_size = self.cache_config.block_size
 
-        self.dcp_world_size = \
+        self.dcp_world_size = (
             vllm_config.parallel_config.decode_context_parallel_size
+        )
         # Note(hc): The scheduler’s block_size must be multiplied
         # by dcp_world_size, since block hashes are computed on the
         # original full token sequence at a granularity of
@@ -247,7 +275,8 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.ISRTF
         else:
             raise ValueError(
-                f"Unknown scheduling policy: {self.scheduler_config.policy}")
+                f"Unknown scheduling policy: {self.scheduler_config.policy}"
+            )
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
@@ -280,7 +309,8 @@ class Scheduler(SchedulerInterface):
         # the encoder cache will not be initialized because cache size is 0
         # for these models.
         self.encoder_cache_manager = EncoderCacheManager(
-            cache_size=encoder_cache_size)
+            cache_size=encoder_cache_size
+        )
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
@@ -297,12 +327,15 @@ class Scheduler(SchedulerInterface):
         if not self.vllm_config.model_config.skip_tokenizer_init:
             try:
                 tokenizer = init_tokenizer_from_configs(
-                    model_config=self.vllm_config.model_config)
+                    model_config=self.vllm_config.model_config
+                )
             except Exception:
                 # If tokenizer initialization fails, continue without it
-                logger.warning("Failed to initialize tokenizer for prefix cache logging")
+                logger.warning(
+                    "Failed to initialize tokenizer for prefix cache logging"
+                )
                 tokenizer = None
-        
+
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -320,7 +353,7 @@ class Scheduler(SchedulerInterface):
         csv_log_enabled = os.environ.get("VLLM_SCHEDULER_CSV_LOG", "0") == "1"
         self.csv_log_dir = os.environ.get(
             "VLLM_SCHEDULER_CSV_LOG_DIR",
-            "/tmp/vllm_scheduler_logs" if csv_log_enabled else None
+            "/tmp/vllm_scheduler_logs" if csv_log_enabled else None,
         )
         self.batch_csv_file = None
         self.request_csv_file = None
@@ -328,28 +361,32 @@ class Scheduler(SchedulerInterface):
         self.request_csv_writer = None
         self.iteration_counter = 0
         self.csv_rows_written = 0  # Track rows written to current file
-        self.csv_max_rows = int(os.environ.get("VLLM_SCHEDULER_CSV_MAX_ROWS", "1000000"))  # Default 1M rows per file
+        self.csv_max_rows = int(
+            os.environ.get("VLLM_SCHEDULER_CSV_MAX_ROWS", "1000000")
+        )  # Default 1M rows per file
         self.csv_file_counter = 0  # Counter for file rotation
-        
+
         if self.csv_log_dir:
             os.makedirs(self.csv_log_dir, exist_ok=True)
             self._open_csv_files()
-            
-            logger.info(f"CSV logging enabled. Logs will be saved to {self.csv_log_dir}")
-        
+
+            logger.info(
+                f"CSV logging enabled. Logs will be saved to {self.csv_log_dir}"
+            )
+
         # [NOTE, hyunnnchoi, 2025.12.01] ELIS Predictor initialization
         # Based on: https://arxiv.org/abs/2505.09142
         self.elis_predictor = None
         self.elis_tokenizer = None
         self.elis_prediction_interval = 50  # Re-predict every 50 tokens
         self.elis_enabled = self.policy == SchedulingPolicy.ISRTF
-        
+
         # [NOTE, hyunnnchoi, 2025.12.07] ISRTF metrics tracker initialization
         self.isrtf_metrics_tracker = None
         if self.elis_enabled:
             self._init_elis_predictor()
             self._init_isrtf_metrics_tracker()
-        
+
         # [NOTE, hyunnnchoi, 2025.12.11] HOL Blocking tracker initialization
         hol_tracking_enabled = os.environ.get("VLLM_HOL_TRACKING", "0") == "1"
         self.hol_tracker: Optional[HOLBlockingTracker] = None
@@ -359,7 +396,7 @@ class Scheduler(SchedulerInterface):
             )
             self.hol_tracker = HOLBlockingTracker(log_dir=hol_log_dir)
             logger.info(f"HOL Blocking tracking enabled. Logs: {hol_log_dir}")
-        
+
         # NOTE, hyunnnchoi, 2025.12.23: Track iteration timing for execution time calculation
         self._last_iteration_start_time = time.monotonic()
 
@@ -367,41 +404,67 @@ class Scheduler(SchedulerInterface):
         """Open CSV files for logging. Creates new files or rotates existing ones."""
         if not self.csv_log_dir:
             return
-        
+
         # Close existing files if open
         self._close_csv_files()
-        
+
         # Batch log CSV - iteration마다 한 행
         batch_csv_path = os.path.join(
-            self.csv_log_dir, 
-            f"batch_log_dp{self.parallel_config.data_parallel_rank}_part{self.csv_file_counter}.csv"
+            self.csv_log_dir,
+            f"batch_log_dp{self.parallel_config.data_parallel_rank}_part{self.csv_file_counter}.csv",
         )
-        self.batch_csv_file = open(batch_csv_path, 'w', newline='', buffering=1)  # Line buffering
+        self.batch_csv_file = open(
+            batch_csv_path, "w", newline="", buffering=1
+        )  # Line buffering
         self.batch_csv_writer = csv.writer(self.batch_csv_file)
-        self.batch_csv_writer.writerow([
-            'iteration', 'timestamp', 'iteration_time_ms',
-            'new_reqs', 'running_reqs', 'resumed_reqs', 'total_reqs',
-            'total_tokens', 'waiting_reqs', 'preempted_reqs',
-            'prefill_reqs', 'decode_reqs', 'prefill_ratio'
-        ])
+        self.batch_csv_writer.writerow(
+            [
+                "iteration",
+                "timestamp",
+                "iteration_time_ms",
+                "new_reqs",
+                "running_reqs",
+                "resumed_reqs",
+                "total_reqs",
+                "total_tokens",
+                "waiting_reqs",
+                "preempted_reqs",
+                "prefill_reqs",
+                "decode_reqs",
+                "prefill_ratio",
+            ]
+        )
         self.batch_csv_file.flush()
-        
+
         # Request log CSV - iteration마다 각 request별로 한 행씩
         request_csv_path = os.path.join(
             self.csv_log_dir,
-            f"request_log_dp{self.parallel_config.data_parallel_rank}_part{self.csv_file_counter}.csv"
+            f"request_log_dp{self.parallel_config.data_parallel_rank}_part{self.csv_file_counter}.csv",
         )
-        self.request_csv_file = open(request_csv_path, 'w', newline='', buffering=1)  # Line buffering
+        self.request_csv_file = open(
+            request_csv_path, "w", newline="", buffering=1
+        )  # Line buffering
         self.request_csv_writer = csv.writer(self.request_csv_file)
-        self.request_csv_writer.writerow([
-            'iteration', 'timestamp', 'request_id', 'phase',
-            'num_prompt_tokens', 'num_output_tokens', 'num_computed_tokens',
-            'chunk_start', 'chunk_end', 'num_scheduled_tokens'
-        ])
+        self.request_csv_writer.writerow(
+            [
+                "iteration",
+                "timestamp",
+                "request_id",
+                "phase",
+                "num_prompt_tokens",
+                "num_output_tokens",
+                "num_computed_tokens",
+                "chunk_start",
+                "chunk_end",
+                "num_scheduled_tokens",
+            ]
+        )
         self.request_csv_file.flush()
-        
+
         self.csv_rows_written = 0
-        logger.info(f"Opened CSV files part {self.csv_file_counter}: {batch_csv_path}, {request_csv_path}")
+        logger.info(
+            f"Opened CSV files part {self.csv_file_counter}: {batch_csv_path}, {request_csv_path}"
+        )
 
     def _close_csv_files(self) -> None:
         """Close CSV files if they are open."""
@@ -414,7 +477,7 @@ class Scheduler(SchedulerInterface):
             finally:
                 self.batch_csv_file = None
                 self.batch_csv_writer = None
-        
+
         if self.request_csv_file is not None:
             try:
                 self.request_csv_file.flush()
@@ -429,7 +492,7 @@ class Scheduler(SchedulerInterface):
         """Check if CSV files need to be rotated based on row count."""
         if not self.csv_log_dir:
             return
-        
+
         # Rotate when we reach the max rows limit
         # Note: This tracks request rows (more accurate) but applies to both files
         if self.csv_rows_written >= self.csv_max_rows:
@@ -446,63 +509,66 @@ class Scheduler(SchedulerInterface):
         """Initialize ELIS response length predictor model."""
         import torch
         from transformers import AutoTokenizer
-        
+
         # Get ELIS config from environment variables
         elis_checkpoint = os.environ.get(
             "VLLM_ELIS_CHECKPOINT",
-            "/home/work/hyunmokchoi/ELIS/train/checkpoints/latest_model.pt"
+            "/home/work/hyunmokchoi/ELIS/train/checkpoints/latest_model.pt",
         )
         elis_bge_model = os.environ.get(
-            "VLLM_ELIS_BGE_MODEL",
-            "BAAI/bge-base-en-v1.5"
+            "VLLM_ELIS_BGE_MODEL", "BAAI/bge-base-en-v1.5"
         )
-        self.elis_prediction_interval = int(os.environ.get(
-            "VLLM_ELIS_PREDICTION_INTERVAL",
-            "50"
-        ))
-        self.elis_max_length = int(os.environ.get(
-            "VLLM_ELIS_MAX_LENGTH",
-            "512"
-        ))
-        
+        self.elis_prediction_interval = int(
+            os.environ.get("VLLM_ELIS_PREDICTION_INTERVAL", "50")
+        )
+        self.elis_max_length = int(
+            os.environ.get("VLLM_ELIS_MAX_LENGTH", "512")
+        )
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
         logger.info(f"[ELIS] Initializing predictor...")
         logger.info(f"[ELIS] Checkpoint: {elis_checkpoint}")
         logger.info(f"[ELIS] BGE model: {elis_bge_model}")
-        logger.info(f"[ELIS] Prediction interval: {self.elis_prediction_interval} tokens")
-        
+        logger.info(
+            f"[ELIS] Prediction interval: {self.elis_prediction_interval} tokens"
+        )
+
         try:
             # Import ELIS model
             import sys
+
             elis_path = os.environ.get(
-                "VLLM_ELIS_PATH",
-                "/home/work/hyunmokchoi/ELIS"
+                "VLLM_ELIS_PATH", "/home/work/hyunmokchoi/ELIS"
             )
             sys.path.insert(0, os.path.join(elis_path, "train"))
             from model import ELISPredictor
-            
+
             # Initialize model
             self.elis_predictor = ELISPredictor(
                 bge_model_name=elis_bge_model,
                 hidden_dim=1024,
                 num_layers=8,
-                freeze_bge=True
+                freeze_bge=True,
             )
-            
+
             # Load checkpoint
-            checkpoint = torch.load(elis_checkpoint, map_location=device, weights_only=False)
-            self.elis_predictor.load_state_dict(checkpoint['model_state_dict'])
+            checkpoint = torch.load(
+                elis_checkpoint, map_location=device, weights_only=False
+            )
+            self.elis_predictor.load_state_dict(checkpoint["model_state_dict"])
             self.elis_predictor = self.elis_predictor.to(device)
             self.elis_predictor.eval()
-            
+
             # Initialize tokenizer
             self.elis_tokenizer = AutoTokenizer.from_pretrained(elis_bge_model)
             self.elis_device = device
-            
-            logger.info(f"[ELIS] Predictor initialized successfully on {device}")
+
+            logger.info(
+                f"[ELIS] Predictor initialized successfully on {device}"
+            )
             logger.info(f"[ELIS] Model epoch: {checkpoint.get('epoch', 'N/A')}")
-            
+
         except Exception as e:
             logger.error(f"[ELIS] Failed to initialize predictor: {e}")
             logger.warning("[ELIS] Falling back to FCFS scheduling")
@@ -517,117 +583,130 @@ class Scheduler(SchedulerInterface):
         try:
             # Get metrics config from environment variables
             metrics_log_dir = os.environ.get(
-                "VLLM_ISRTF_METRICS_DIR",
-                "/tmp/isrtf_metrics"
+                "VLLM_ISRTF_METRICS_DIR", "/tmp/isrtf_metrics"
             )
-            enable_detailed_logging = os.environ.get(
-                "VLLM_ISRTF_DETAILED_LOGGING",
-                "true"
-            ).lower() == "true"
-            kendall_tau_window = int(os.environ.get(
-                "VLLM_ISRTF_KENDALL_WINDOW",
-                "100"
-            ))
-            
+            enable_detailed_logging = (
+                os.environ.get("VLLM_ISRTF_DETAILED_LOGGING", "true").lower()
+                == "true"
+            )
+            kendall_tau_window = int(
+                os.environ.get("VLLM_ISRTF_KENDALL_WINDOW", "100")
+            )
+
             self.isrtf_metrics_tracker = ISRTFMetricsTracker(
                 log_dir=metrics_log_dir,
                 enable_detailed_logging=enable_detailed_logging,
-                kendall_tau_window=kendall_tau_window
+                kendall_tau_window=kendall_tau_window,
             )
-            
+
             logger.info(f"[ISRTF Metrics] Tracker initialized")
             logger.info(f"[ISRTF Metrics] Log directory: {metrics_log_dir}")
-            logger.info(f"[ISRTF Metrics] Detailed logging: {enable_detailed_logging}")
-            logger.info(f"[ISRTF Metrics] Kendall's tau window: {kendall_tau_window}")
-            
+            logger.info(
+                f"[ISRTF Metrics] Detailed logging: {enable_detailed_logging}"
+            )
+            logger.info(
+                f"[ISRTF Metrics] Kendall's tau window: {kendall_tau_window}"
+            )
+
         except Exception as e:
             logger.error(f"[ISRTF Metrics] Failed to initialize tracker: {e}")
-            logger.warning("[ISRTF Metrics] Continuing without metrics tracking")
+            logger.warning(
+                "[ISRTF Metrics] Continuing without metrics tracking"
+            )
             self.isrtf_metrics_tracker = None
 
     def _elis_predict(self, text: str) -> float:
         """
         Predict remaining tokens for a given text context.
-        
+
         Args:
             text: Full context (prompt + generated text so far)
-            
+
         Returns:
             Predicted remaining tokens
         """
         if self.elis_predictor is None or self.elis_tokenizer is None:
-            return float('inf')
-        
+            return float("inf")
+
         import torch
-        
+
         try:
             # Tokenize
             encoded = self.elis_tokenizer(
                 text,
                 max_length=self.elis_max_length,
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
-                return_tensors='pt'
+                return_tensors="pt",
             )
-            
-            input_ids = encoded['input_ids'].to(self.elis_device)
-            attention_mask = encoded['attention_mask'].to(self.elis_device)
-            
+
+            input_ids = encoded["input_ids"].to(self.elis_device)
+            attention_mask = encoded["attention_mask"].to(self.elis_device)
+
             # Predict
             with torch.no_grad():
                 prediction = self.elis_predictor(input_ids, attention_mask)
-            
+
             # Clamp to non-negative
             return max(0.0, prediction.item())
-            
+
         except Exception as e:
             logger.warning(f"[ELIS] Prediction failed: {e}")
-            return float('inf')
+            return float("inf")
 
     def _elis_update_request_prediction(self, request: Request) -> bool:
         """
         Update ELIS prediction for a request if needed.
-        
+
         Called every 50 tokens as per ELIS paper.
-        
+
         Args:
             request: Request to update prediction for
-            
+
         Returns:
             True if prediction was updated, False otherwise
         """
         if not self.elis_enabled:
             return False
-        
+
         # Check if update is needed (every 50 tokens)
-        tokens_since_last = request.num_output_tokens - request.last_prediction_at_tokens
+        tokens_since_last = (
+            request.num_output_tokens - request.last_prediction_at_tokens
+        )
         if tokens_since_last < self.elis_prediction_interval:
             return False
-        
+
         # Build full context: prompt + generated text
         # Note: We need to decode token IDs to text for BGE model
         try:
             if self.elis_tokenizer is None:
                 return False
-            
+
             # Decode prompt tokens
             prompt_text = self.elis_tokenizer.decode(
-                request.prompt_token_ids[:self.elis_max_length] if request.prompt_token_ids else [],
-                skip_special_tokens=True
+                request.prompt_token_ids[: self.elis_max_length]
+                if request.prompt_token_ids
+                else [],
+                skip_special_tokens=True,
             )
-            
+
             # Decode output tokens
-            output_text = self.elis_tokenizer.decode(
-                request.output_token_ids,
-                skip_special_tokens=True
-            ) if request.output_token_ids else ""
-            
+            output_text = (
+                self.elis_tokenizer.decode(
+                    request.output_token_ids, skip_special_tokens=True
+                )
+                if request.output_token_ids
+                else ""
+            )
+
             # Full context
-            full_context = prompt_text + " " + output_text if output_text else prompt_text
-            
+            full_context = (
+                prompt_text + " " + output_text if output_text else prompt_text
+            )
+
             # Predict
             predicted_remaining = self._elis_predict(full_context)
-            
+
             # Update request
             old_prediction = request.predicted_remaining_tokens
             request.predicted_remaining_tokens = predicted_remaining
@@ -635,27 +714,27 @@ class Scheduler(SchedulerInterface):
             request.prediction_history.append(
                 (request.num_output_tokens, predicted_remaining)
             )
-            
+
             logger.debug(
                 f"[ELIS] Request {request.request_id[:8]}... prediction updated: "
                 f"{old_prediction:.1f} -> {predicted_remaining:.1f} "
                 f"(at {request.num_output_tokens} tokens)"
             )
-            
+
             # [NOTE, hyunnnchoi, 2025.12.07] Track prediction update in metrics
             if self.isrtf_metrics_tracker:
                 self.isrtf_metrics_tracker.update_prediction(
                     request_id=request.request_id,
                     num_output_tokens=request.num_output_tokens,
-                    predicted_remaining=predicted_remaining
+                    predicted_remaining=predicted_remaining,
                 )
-            
+
             # Update priority in waiting queue if using ISRTF
             if isinstance(self.waiting, ISRTFRequestQueue):
                 self.waiting.update_request_priority(request)
-            
+
             return True
-            
+
         except Exception as e:
             logger.warning(f"[ELIS] Failed to update prediction: {e}")
             return False
@@ -663,46 +742,48 @@ class Scheduler(SchedulerInterface):
     def _elis_initial_prediction(self, request: Request) -> None:
         """
         Make initial ELIS prediction for a new request.
-        
+
         Args:
             request: New request to predict for
         """
         if not self.elis_enabled:
             return
-        
+
         try:
             if self.elis_tokenizer is None:
                 return
-            
+
             # Decode prompt tokens
             prompt_text = self.elis_tokenizer.decode(
-                request.prompt_token_ids[:self.elis_max_length] if request.prompt_token_ids else [],
-                skip_special_tokens=True
+                request.prompt_token_ids[: self.elis_max_length]
+                if request.prompt_token_ids
+                else [],
+                skip_special_tokens=True,
             )
-            
+
             # Initial prediction (no output yet)
             predicted_remaining = self._elis_predict(prompt_text)
-            
+
             request.predicted_remaining_tokens = predicted_remaining
             request.last_prediction_at_tokens = 0
             request.prediction_history.append((0, predicted_remaining))
-            
+
             logger.debug(
                 f"[ELIS] Request {request.request_id[:8]}... initial prediction: "
                 f"{predicted_remaining:.1f} tokens"
             )
-            
+
             # [NOTE, hyunnnchoi, 2025.12.07] Track initial prediction in metrics
             if self.isrtf_metrics_tracker:
                 self.isrtf_metrics_tracker.register_request(
                     request_id=request.request_id,
                     arrival_time=request.arrival_time,
-                    initial_prediction=predicted_remaining
+                    initial_prediction=predicted_remaining,
                 )
-            
+
         except Exception as e:
             logger.warning(f"[ELIS] Failed initial prediction: {e}")
-            request.predicted_remaining_tokens = float('inf')
+            request.predicted_remaining_tokens = float("inf")
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -744,30 +825,42 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            num_new_tokens = (request.num_tokens_with_spec +
-                              request.num_output_placeholders -
-                              request.num_computed_tokens)
-            if (0 < self.scheduler_config.long_prefill_token_threshold <
-                    num_new_tokens):
+            num_new_tokens = (
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+            )
+            if (
+                0
+                < self.scheduler_config.long_prefill_token_threshold
+                < num_new_tokens
+            ):
                 num_new_tokens = (
-                    self.scheduler_config.long_prefill_token_threshold)
+                    self.scheduler_config.long_prefill_token_threshold
+                )
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
                 num_new_tokens,
-                self.max_model_len - 1 - request.num_computed_tokens)
+                self.max_model_len - 1 - request.num_computed_tokens,
+            )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             new_encoder_compute_budget = encoder_compute_budget
             if request.has_encoder_inputs:
-                (encoder_inputs_to_schedule, num_new_tokens,
-                 new_encoder_compute_budget
-                 ) = self._try_schedule_encoder_inputs(
-                     request, request.num_computed_tokens, num_new_tokens,
-                     encoder_compute_budget)
+                (
+                    encoder_inputs_to_schedule,
+                    num_new_tokens,
+                    new_encoder_compute_budget,
+                ) = self._try_schedule_encoder_inputs(
+                    request,
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    encoder_compute_budget,
+                )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -789,7 +882,8 @@ class Scheduler(SchedulerInterface):
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
-                    num_lookahead_tokens=self.num_lookahead_tokens)
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                )
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -810,7 +904,8 @@ class Scheduler(SchedulerInterface):
                     preempted_req.num_computed_tokens = 0
                     if self.log_stats:
                         preempted_req.record_event(
-                            EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+                            EngineCoreEventType.PREEMPTED, scheduled_timestamp
+                        )
 
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
@@ -835,19 +930,23 @@ class Scheduler(SchedulerInterface):
 
             # Speculative decode related.
             if request.spec_token_ids:
-                num_scheduled_spec_tokens = (num_new_tokens +
-                                             request.num_computed_tokens -
-                                             request.num_tokens)
+                num_scheduled_spec_tokens = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                )
                 if num_scheduled_spec_tokens > 0:
                     # Trim spec_token_ids list to num_scheduled_spec_tokens.
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = (
-                        request.spec_token_ids)
+                        request.spec_token_ids
+                    )
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
                 scheduled_encoder_inputs[request.request_id] = (
-                    encoder_inputs_to_schedule)
+                    encoder_inputs_to_schedule
+                )
                 # Allocate the encoder cache.
                 for i in encoder_inputs_to_schedule:
                     self.encoder_cache_manager.allocate(request, i)
@@ -857,8 +956,10 @@ class Scheduler(SchedulerInterface):
         scheduled_loras: set[int] = set()
         if self.lora_config:
             scheduled_loras = set(
-                req.lora_request.lora_int_id for req in scheduled_running_reqs
-                if req.lora_request and req.lora_request.lora_int_id > 0)
+                req.lora_request.lora_int_id
+                for req in scheduled_running_reqs
+                if req.lora_request and req.lora_request.lora_int_id > 0
+            )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Use a temporary RequestQueue to collect requests that need to be
@@ -876,8 +977,8 @@ class Scheduler(SchedulerInterface):
                                 request_id=req.request_id,
                                 queue_position=idx,
                                 num_waiting=len(self.waiting),
-                                event_type='blocking',
-                                blocking_reason='max_running_reqs',
+                                event_type="blocking",
+                                blocking_reason="max_running_reqs",
                                 token_budget=token_budget,
                                 num_running=len(self.running),
                             )
@@ -893,7 +994,8 @@ class Scheduler(SchedulerInterface):
                     else:
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request.request_id)
+                            request.request_id,
+                        )
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -911,9 +1013,15 @@ class Scheduler(SchedulerInterface):
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
-                if (self.lora_config and request.lora_request and
-                    (len(scheduled_loras) == self.lora_config.max_loras and
-                     request.lora_request.lora_int_id not in scheduled_loras)):
+                if (
+                    self.lora_config
+                    and request.lora_request
+                    and (
+                        len(scheduled_loras) == self.lora_config.max_loras
+                        and request.lora_request.lora_int_id
+                        not in scheduled_loras
+                    )
+                ):
                     # Scheduling would exceed max_loras, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
@@ -925,15 +1033,17 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = \
-                        self.kv_cache_manager.get_computed_blocks(
-                            request)
+                    new_computed_blocks, num_new_local_computed_tokens = (
+                        self.kv_cache_manager.get_computed_blocks(request)
+                    )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens))
+                                request, num_new_local_computed_tokens
+                            )
+                        )
 
                         if num_external_computed_tokens is None:
                             # The request cannot be scheduled because
@@ -944,13 +1054,16 @@ class Scheduler(SchedulerInterface):
                             continue
 
                     # Total computed tokens (local + external).
-                    num_computed_tokens = (num_new_local_computed_tokens +
-                                           num_external_computed_tokens)
+                    num_computed_tokens = (
+                        num_new_local_computed_tokens
+                        + num_external_computed_tokens
+                    )
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
                 else:
                     new_computed_blocks = (
-                        self.kv_cache_manager.create_empty_block_list())
+                        self.kv_cache_manager.create_empty_block_list()
+                    )
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
@@ -967,15 +1080,21 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    if (0 < self.scheduler_config.long_prefill_token_threshold
-                            < num_new_tokens):
+                    if (
+                        0
+                        < self.scheduler_config.long_prefill_token_threshold
+                        < num_new_tokens
+                    ):
                         num_new_tokens = (
-                            self.scheduler_config.long_prefill_token_threshold)
+                            self.scheduler_config.long_prefill_token_threshold
+                        )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
-                    if not self.scheduler_config.chunked_prefill_enabled and \
-                        num_new_tokens > token_budget:
+                    if (
+                        not self.scheduler_config.chunked_prefill_enabled
+                        and num_new_tokens > token_budget
+                    ):
                         # [NOTE, hyunnnchoi, 2025.12.11] Track HOL blocking due to token budget
                         if self.hol_tracker is not None:
                             # Get current queue position
@@ -988,8 +1107,8 @@ class Scheduler(SchedulerInterface):
                                 request_id=request.request_id,
                                 queue_position=queue_pos,
                                 num_waiting=len(self.waiting),
-                                event_type='blocking',
-                                blocking_reason='token_budget_insufficient',
+                                event_type="blocking",
+                                blocking_reason="token_budget_insufficient",
                                 token_budget=token_budget,
                                 num_running=len(self.running),
                             )
@@ -1002,11 +1121,16 @@ class Scheduler(SchedulerInterface):
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
-                        (encoder_inputs_to_schedule, num_new_tokens,
-                         new_encoder_compute_budget
-                         ) = self._try_schedule_encoder_inputs(
-                             request, num_computed_tokens, num_new_tokens,
-                             encoder_compute_budget)
+                        (
+                            encoder_inputs_to_schedule,
+                            num_new_tokens,
+                            new_encoder_compute_budget,
+                        ) = self._try_schedule_encoder_inputs(
+                            request,
+                            num_computed_tokens,
+                            num_new_tokens,
+                            encoder_compute_budget,
+                        )
                         if num_new_tokens == 0:
                             # [NOTE, hyunnnchoi, 2025.12.11] Track HOL blocking due to encoder
                             if self.hol_tracker is not None:
@@ -1019,8 +1143,8 @@ class Scheduler(SchedulerInterface):
                                     request_id=request.request_id,
                                     queue_position=queue_pos,
                                     num_waiting=len(self.waiting),
-                                    event_type='blocking',
-                                    blocking_reason='encoder_budget_insufficient',
+                                    event_type="blocking",
+                                    blocking_reason="encoder_budget_insufficient",
                                     token_budget=token_budget,
                                     num_running=len(self.running),
                                 )
@@ -1032,9 +1156,11 @@ class Scheduler(SchedulerInterface):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
-                effective_lookahead_tokens = (0 if request.num_computed_tokens
-                                              == 0 else
-                                              self.num_lookahead_tokens)
+                effective_lookahead_tokens = (
+                    0
+                    if request.num_computed_tokens == 0
+                    else self.num_lookahead_tokens
+                )
 
                 # Determine if we need to allocate cross-attention blocks.
                 if self.is_encoder_decoder and request.has_encoder_inputs:
@@ -1042,8 +1168,9 @@ class Scheduler(SchedulerInterface):
                     # always padded to the maximum length. If we support other
                     # encoder-decoder models, this will need to be updated if we
                     # want to only allocate what is needed.
-                    num_encoder_tokens =\
+                    num_encoder_tokens = (
                         self.scheduler_config.max_num_encoder_input_tokens
+                    )
                 else:
                     num_encoder_tokens = 0
 
@@ -1070,8 +1197,8 @@ class Scheduler(SchedulerInterface):
                             request_id=request.request_id,
                             queue_position=queue_pos,
                             num_waiting=len(self.waiting),
-                            event_type='blocking',
-                            blocking_reason='kv_cache_full',
+                            event_type="blocking",
+                            blocking_reason="kv_cache_full",
                             token_budget=token_budget,
                             num_running=len(self.running),
                         )
@@ -1082,8 +1209,8 @@ class Scheduler(SchedulerInterface):
                                     request_id=blocked_req.request_id,
                                     queue_position=idx,
                                     num_waiting=len(self.waiting),
-                                    event_type='blocking',
-                                    blocking_reason='blocked_by_hol',
+                                    event_type="blocking",
+                                    blocking_reason="blocked_by_hol",
                                     token_budget=token_budget,
                                     num_running=len(self.running),
                                 )
@@ -1114,33 +1241,36 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 self.running.append(request)
                 if self.log_stats:
-                    request.record_event(EngineCoreEventType.SCHEDULED,
-                                         scheduled_timestamp)
-                
+                    request.record_event(
+                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                    )
+
                 # [NOTE, hyunnnchoi, 2025.12.11] Track successful scheduling
                 if self.hol_tracker is not None:
                     self.hol_tracker.record_scheduling_attempt(
                         request_id=request.request_id,
                         queue_position=-1,  # No longer in queue
                         num_waiting=len(self.waiting),
-                        event_type='scheduled',
-                        blocking_reason='',
+                        event_type="scheduled",
+                        blocking_reason="",
                         token_budget=token_budget,
                         num_running=len(self.running),
                     )
-                
+
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(
-                        f"Invalid request status: {request.status}")
+                        f"Invalid request status: {request.status}"
+                    )
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request.request_id] = (
-                    self.kv_cache_manager.get_blocks(request.request_id))
+                    self.kv_cache_manager.get_blocks(request.request_id)
+                )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1151,7 +1281,8 @@ class Scheduler(SchedulerInterface):
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request.request_id] = (
-                        encoder_inputs_to_schedule)
+                        encoder_inputs_to_schedule
+                    )
                     # Allocate the encoder cache.
                     for i in encoder_inputs_to_schedule:
                         self.encoder_cache_manager.allocate(request, i)
@@ -1169,23 +1300,28 @@ class Scheduler(SchedulerInterface):
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
-        assert (len(scheduled_new_reqs) + len(scheduled_resumed_reqs) +
-                len(scheduled_running_reqs) <= len(self.running))
+        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
+            scheduled_running_reqs
+        ) <= len(self.running)
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(
-            self.kv_cache_config.kv_cache_groups)
+            self.kv_cache_config.kv_cache_groups
+        )
         if self.running:
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
-                    any_request, len(self.running)))
+                    any_request, len(self.running)
+                )
+            )
 
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids())
+                req, req_to_new_blocks[req.request_id].get_block_ids()
+            )
             for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(
@@ -1195,11 +1331,14 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_blocks,
         )
-        scheduled_requests = (scheduled_new_reqs + scheduled_running_reqs +
-                              scheduled_resumed_reqs)
+        scheduled_requests = (
+            scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
+        )
         structured_output_request_ids, grammar_bitmask = (
-            self.get_grammar_bitmask(scheduled_requests,
-                                     scheduled_spec_decode_tokens))
+            self.get_grammar_bitmask(
+                scheduled_requests, scheduled_spec_decode_tokens
+            )
+        )
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1213,8 +1352,7 @@ class Scheduler(SchedulerInterface):
             # It contains the request IDs that are finished in between
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=self.encoder_cache_manager.
-            get_freed_mm_hashes(),
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
@@ -1248,78 +1386,98 @@ class Scheduler(SchedulerInterface):
         if logger.isEnabledFor(logging.INFO):
             # 1. Iteration 시간 계산
             iteration_time_ms = (time.monotonic() - scheduled_timestamp) * 1000
-            
+
             scheduled_req_ids = (
-                [r.request_id for r in scheduled_new_reqs] +
-                [r.request_id for r in scheduled_running_reqs] +
-                [r.request_id for r in scheduled_resumed_reqs]
+                [r.request_id for r in scheduled_new_reqs]
+                + [r.request_id for r in scheduled_running_reqs]
+                + [r.request_id for r in scheduled_resumed_reqs]
             )
-            
+
             # 2. Running request들의 토큰 인덱스 정보
-            all_scheduled_reqs = scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
+            all_scheduled_reqs = (
+                scheduled_new_reqs
+                + scheduled_running_reqs
+                + scheduled_resumed_reqs
+            )
             running_req_token_info = {}
             prefill_count = 0
             decode_count = 0
-            
+
             for req in all_scheduled_reqs:
                 is_prefill = req.num_computed_tokens < req.num_prompt_tokens
                 if is_prefill:
                     prefill_count += 1
                 else:
                     decode_count += 1
-                
+
                 # Prefill phase 분류
                 # scheduled_new_reqs에 포함된 request는 첫 번째 스케줄링
                 is_first_prefill = req in scheduled_new_reqs and is_prefill
-                
-                if is_prefill and is_first_prefill and req.num_computed_tokens > 0:
+
+                if (
+                    is_prefill
+                    and is_first_prefill
+                    and req.num_computed_tokens > 0
+                ):
                     # 첫 prefill이지만 prefix cache로 인해 일부 토큰이 이미 계산됨
                     chunk_start = req.num_computed_tokens
-                    chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                    chunk_end = (
+                        req.num_computed_tokens
+                        + num_scheduled_tokens.get(req.request_id, 0)
+                    )
                     running_req_token_info[req.request_id] = {
-                        'computed': req.num_computed_tokens,
-                        'input_tokens': req.num_prompt_tokens,
-                        'output_tokens': req.num_output_tokens,
-                        'phase': f'prefill_first_cached[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]'
+                        "computed": req.num_computed_tokens,
+                        "input_tokens": req.num_prompt_tokens,
+                        "output_tokens": req.num_output_tokens,
+                        "phase": f"prefill_first_cached[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]",
                     }
                 elif is_prefill and req.num_computed_tokens > 0:
                     # Chunked prefill 중 (이미 처리 중인 request)
                     chunk_start = req.num_computed_tokens
-                    chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                    chunk_end = (
+                        req.num_computed_tokens
+                        + num_scheduled_tokens.get(req.request_id, 0)
+                    )
                     running_req_token_info[req.request_id] = {
-                        'computed': req.num_computed_tokens,
-                        'input_tokens': req.num_prompt_tokens,
-                        'output_tokens': req.num_output_tokens,
-                        'phase': f'prefill_chunk[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]'
+                        "computed": req.num_computed_tokens,
+                        "input_tokens": req.num_prompt_tokens,
+                        "output_tokens": req.num_output_tokens,
+                        "phase": f"prefill_chunk[{chunk_start}:{chunk_end}/{req.num_prompt_tokens}]",
                     }
                 elif is_prefill:
                     # 첫 prefill (prefix cache 없음)
                     chunk_end = num_scheduled_tokens.get(req.request_id, 0)
                     running_req_token_info[req.request_id] = {
-                        'computed': req.num_computed_tokens,
-                        'input_tokens': req.num_prompt_tokens,
-                        'output_tokens': req.num_output_tokens,
-                        'phase': f'prefill_first[0:{chunk_end}/{req.num_prompt_tokens}]'
+                        "computed": req.num_computed_tokens,
+                        "input_tokens": req.num_prompt_tokens,
+                        "output_tokens": req.num_output_tokens,
+                        "phase": f"prefill_first[0:{chunk_end}/{req.num_prompt_tokens}]",
                     }
                 else:
                     # Decode phase
                     running_req_token_info[req.request_id] = {
-                        'computed': req.num_computed_tokens,
-                        'input_tokens': req.num_prompt_tokens,
-                        'output_tokens': req.num_output_tokens,
-                        'phase': f'decode[token_{req.num_output_tokens + 1}]'
+                        "computed": req.num_computed_tokens,
+                        "input_tokens": req.num_prompt_tokens,
+                        "output_tokens": req.num_output_tokens,
+                        "phase": f"decode[token_{req.num_output_tokens + 1}]",
                     }
-            
+
             # 3. 새로 들어온 request의 input token 정보
-            new_req_info = [(r.request_id, r.num_prompt_tokens) for r in scheduled_new_reqs]
-            
+            new_req_info = [
+                (r.request_id, r.num_prompt_tokens) for r in scheduled_new_reqs
+            ]
+
             # 4. Prefill/decode 비율
             total_phase_reqs = prefill_count + decode_count
-            prefill_ratio = (prefill_count / total_phase_reqs * 100) if total_phase_reqs > 0 else 0
-            
+            prefill_ratio = (
+                (prefill_count / total_phase_reqs * 100)
+                if total_phase_reqs > 0
+                else 0
+            )
+
             # 5. Preempted request 상세 정보
             preempted_req_ids = [r.request_id for r in preempted_reqs]
-            
+
             # 상세 로그 출력
             logger.info(
                 f"Scheduled batch [iter_time={iteration_time_ms:.2f}ms]: "
@@ -1334,11 +1492,11 @@ class Scheduler(SchedulerInterface):
                 f"decode_reqs={decode_count}, "
                 f"prefill_ratio={prefill_ratio:.1f}%"
             )
-            
+
             # 새 request input token 정보
             if new_req_info:
                 logger.info(f"  New requests input tokens: {new_req_info}")
-            
+
             # 각 request의 상세 정보
             if running_req_token_info:
                 logger.info(f"  Request details:")
@@ -1349,49 +1507,65 @@ class Scheduler(SchedulerInterface):
                         f"output={info['output_tokens']}, "
                         f"computed={info['computed']}"
                     )
-            
+
             # CSV 로깅 (환경변수로 활성화된 경우)
-            if self.csv_log_dir and self.batch_csv_writer and self.request_csv_writer:
+            if (
+                self.csv_log_dir
+                and self.batch_csv_writer
+                and self.request_csv_writer
+            ):
                 # Check if file rotation is needed before writing
                 self._check_and_rotate_csv_files()
-                
+
                 current_timestamp = time.time()
-                
+
                 # Batch log - iteration당 한 행
-                self.batch_csv_writer.writerow([
-                    self.iteration_counter,
-                    current_timestamp,
-                    f"{iteration_time_ms:.2f}",
-                    len(scheduled_new_reqs),
-                    len(scheduled_running_reqs),
-                    len(scheduled_resumed_reqs),
-                    len(scheduled_req_ids),
-                    total_num_scheduled_tokens,
-                    len(self.waiting),
-                    len(preempted_reqs),
-                    prefill_count,
-                    decode_count,
-                    f"{prefill_ratio:.1f}"
-                ])
+                self.batch_csv_writer.writerow(
+                    [
+                        self.iteration_counter,
+                        current_timestamp,
+                        f"{iteration_time_ms:.2f}",
+                        len(scheduled_new_reqs),
+                        len(scheduled_running_reqs),
+                        len(scheduled_resumed_reqs),
+                        len(scheduled_req_ids),
+                        total_num_scheduled_tokens,
+                        len(self.waiting),
+                        len(preempted_reqs),
+                        prefill_count,
+                        decode_count,
+                        f"{prefill_ratio:.1f}",
+                    ]
+                )
                 self.batch_csv_file.flush()
-                
+
                 # Request log - 각 request별로 한 행씩
                 request_rows_written = 0
                 for req in all_scheduled_reqs:
                     info = running_req_token_info[req.request_id]
-                    
+
                     # chunk_start, chunk_end 추출
                     is_prefill = req.num_computed_tokens < req.num_prompt_tokens
                     is_first_prefill = req in scheduled_new_reqs and is_prefill
-                    
-                    if is_prefill and is_first_prefill and req.num_computed_tokens > 0:
+
+                    if (
+                        is_prefill
+                        and is_first_prefill
+                        and req.num_computed_tokens > 0
+                    ):
                         # 첫 prefill이지만 prefix cache로 인해 일부 토큰이 이미 계산됨
                         chunk_start = req.num_computed_tokens
-                        chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                        chunk_end = (
+                            req.num_computed_tokens
+                            + num_scheduled_tokens.get(req.request_id, 0)
+                        )
                     elif is_prefill and req.num_computed_tokens > 0:
                         # Chunked prefill
                         chunk_start = req.num_computed_tokens
-                        chunk_end = req.num_computed_tokens + num_scheduled_tokens.get(req.request_id, 0)
+                        chunk_end = (
+                            req.num_computed_tokens
+                            + num_scheduled_tokens.get(req.request_id, 0)
+                        )
                     elif is_prefill:
                         # First prefill (prefix cache 없음)
                         chunk_start = 0
@@ -1400,9 +1574,13 @@ class Scheduler(SchedulerInterface):
                         # Decode
                         chunk_start = -1
                         chunk_end = -1
-                    
+
                     # phase는 prefill_first/prefill_first_cached/prefill_chunk/decode 중 하나
-                    if is_prefill and is_first_prefill and req.num_computed_tokens > 0:
+                    if (
+                        is_prefill
+                        and is_first_prefill
+                        and req.num_computed_tokens > 0
+                    ):
                         phase = "prefill_first_cached"
                     elif is_prefill and req.num_computed_tokens > 0:
                         phase = "prefill_chunk"
@@ -1410,22 +1588,24 @@ class Scheduler(SchedulerInterface):
                         phase = "prefill_first"
                     else:
                         phase = "decode"
-                    
-                    self.request_csv_writer.writerow([
-                        self.iteration_counter,
-                        current_timestamp,
-                        req.request_id,
-                        phase,
-                        info['input_tokens'],
-                        info['output_tokens'],
-                        info['computed'],
-                        chunk_start,
-                        chunk_end,
-                        num_scheduled_tokens.get(req.request_id, 0)
-                    ])
+
+                    self.request_csv_writer.writerow(
+                        [
+                            self.iteration_counter,
+                            current_timestamp,
+                            req.request_id,
+                            phase,
+                            info["input_tokens"],
+                            info["output_tokens"],
+                            info["computed"],
+                            chunk_start,
+                            chunk_end,
+                            num_scheduled_tokens.get(req.request_id, 0),
+                        ]
+                    )
                     request_rows_written += 1
                 self.request_csv_file.flush()
-                
+
                 # Increment row counter (track both batch and request rows)
                 # Use request rows as the primary counter since it's more accurate
                 self.csv_rows_written += request_rows_written
@@ -1433,7 +1613,7 @@ class Scheduler(SchedulerInterface):
 
         # NOTE, hyunnnchoi, 2025.12.23: Save iteration start time for execution time tracking
         self._last_iteration_start_time = iteration_start_time
-        
+
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -1443,8 +1623,10 @@ class Scheduler(SchedulerInterface):
     ) -> None:
         # NOTE, hyunnnchoi, 2025.12.23: Calculate iteration execution time
         iteration_end_time = time.monotonic()
-        iteration_duration_ms = (iteration_end_time - self._last_iteration_start_time) * 1000.0
-        
+        iteration_duration_ms = (
+            iteration_end_time - self._last_iteration_start_time
+        ) * 1000.0
+
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1457,17 +1639,17 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
-            
+
             # NOTE, hyunnnchoi, 2025.12.23: Track first scheduled time and execution time
             if request.first_scheduled_time is None:
                 request.first_scheduled_time = self._last_iteration_start_time
-            
+
             # Accumulate execution time for this iteration
             request.total_execution_time_ms += iteration_duration_ms
             request.scheduled_iterations.append(
                 (self._last_iteration_start_time, iteration_duration_ms)
             )
-            
+
             request.num_computed_tokens += num_scheduled_token
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
@@ -1500,16 +1682,19 @@ class Scheduler(SchedulerInterface):
         for req in itertools.chain(running_reqs, resumed_reqs):
             req_id = req.request_id
             req_ids.append(req_id)
-            num_tokens = (num_scheduled_tokens[req_id] -
-                          len(spec_decode_tokens.get(req_id, ())))
+            num_tokens = num_scheduled_tokens[req_id] - len(
+                spec_decode_tokens.get(req_id, ())
+            )
             if self.use_pp:
                 # When using PP, the scheduler sends the sampled tokens back,
                 # because there's no direct communication between the first-
                 # stage worker and the last-stage worker. Otherwise, we don't
                 # need to send the sampled tokens back because the model runner
                 # will cache them.
-                token_ids = req.all_token_ids[req.num_computed_tokens:req.
-                                              num_computed_tokens + num_tokens]
+                token_ids = req.all_token_ids[
+                    req.num_computed_tokens : req.num_computed_tokens
+                    + num_tokens
+                ]
                 new_token_ids.append(token_ids)
             elif use_connector:
                 # When using a KVConnector, we add a placeholder to avoid index
@@ -1517,7 +1702,8 @@ class Scheduler(SchedulerInterface):
                 # is updated to handle token IDs properly.
                 new_token_ids.append([])
             new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True))
+                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+            )
             num_computed_tokens.append(req.num_computed_tokens)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
@@ -1584,7 +1770,8 @@ class Scheduler(SchedulerInterface):
             if self.is_encoder_decoder and num_computed_tokens > 0:
                 assert start_pos == 0, (
                     "Encoder input should be processed at the beginning of "
-                    "the sequence when encoder-decoder models are used.")
+                    "the sequence when encoder-decoder models are used."
+                )
                 # Encoder input has already been computed
                 # The calculation here is a bit different. We don't turn encoder
                 # output into tokens that get processed by the decoder and
@@ -1609,7 +1796,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 if self.encoder_cache_manager.check_and_update_cache(
-                        request, i):
+                    request, i
+                ):
                     # The encoder input is already computed and cached from a
                     # previous step.
                     continue
@@ -1617,16 +1805,18 @@ class Scheduler(SchedulerInterface):
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
             # only cover part of the mm input, roll back to before the mm item.
-            if (self.scheduler_config.disable_chunked_mm_input
-                    and num_computed_tokens < start_pos
-                    and (num_computed_tokens + num_new_tokens)
-                    < (start_pos + num_encoder_tokens)):
+            if (
+                self.scheduler_config.disable_chunked_mm_input
+                and num_computed_tokens < start_pos
+                and (num_computed_tokens + num_new_tokens)
+                < (start_pos + num_encoder_tokens)
+            ):
                 num_new_tokens = start_pos - num_computed_tokens
                 break
 
             if not self.encoder_cache_manager.can_allocate(
-                    request, i, encoder_compute_budget,
-                    num_tokens_to_schedule):
+                request, i, encoder_compute_budget, num_tokens_to_schedule
+            ):
                 # The encoder cache is full or the encoder budget is exhausted.
                 # NOTE(woosuk): We assume that the encoder input tokens should
                 # be processed altogether, as the encoder usually uses
@@ -1691,7 +1881,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[int, EngineCoreOutputs]:
         # NOTE(hyunnnchoi,2025-10-30): Record iteration timestamp for decode step timing
         iteration_timestamp_ms = time.time() * 1000.0
-        
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1702,8 +1892,11 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
-        kv_connector_stats = (kv_connector_output.kv_connector_stats
-                              if kv_connector_output else None)
+        kv_connector_stats = (
+            kv_connector_output.kv_connector_stats
+            if kv_connector_output
+            else None
+        )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -1720,11 +1913,13 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = sampled_token_ids[
-                req_index] if sampled_token_ids else []
+            generated_token_ids = (
+                sampled_token_ids[req_index] if sampled_token_ids else []
+            )
 
             scheduled_spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            )
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -1738,7 +1933,8 @@ class Scheduler(SchedulerInterface):
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted)
+                    num_accepted_tokens=num_accepted,
+                )
 
             stopped = False
             new_logprobs = None
@@ -1749,8 +1945,9 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
-                    request, new_token_ids)
-                
+                    request, new_token_ids
+                )
+
                 # NOTE(hyunnnchoi,2025-10-30): Record decode step timing for each token
                 for token_id in new_token_ids:
                     num_output_tokens = len(request.output_token_ids)
@@ -1760,7 +1957,7 @@ class Scheduler(SchedulerInterface):
                     # Record first token timestamp
                     if request.first_token_timestamp is None:
                         request.first_token_timestamp = iteration_timestamp_ms
-                
+
                 # [NOTE, hyunnnchoi, 2025.12.01] ELIS: Update prediction every 50 tokens
                 if self.elis_enabled and not stopped:
                     self._elis_update_request_prediction(request)
@@ -1769,13 +1966,12 @@ class Scheduler(SchedulerInterface):
             pooler_output = None
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
-                stopped = check_stop(request, self.max_model_len,
-                                     pooler_output)
+                stopped = check_stop(request, self.max_model_len, pooler_output)
 
             if stopped:
                 # NOTE(hyunnnchoi,2025-10-30): Save decode step timings to file
                 self._save_decode_timings(request)
-                
+
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1783,28 +1979,31 @@ class Scheduler(SchedulerInterface):
                     stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None \
-                and request.sampling_params.logprobs is not None and logprobs:
+            if (
+                request.sampling_params is not None
+                and request.sampling_params.logprobs is not None
+                and logprobs
+            ):
                 # NOTE: once we support N tokens per step (spec decode),
                 # the outer lists can be of length > 1.
                 new_logprobs = logprobs.slice(req_index, req_index + 1)
 
             if new_token_ids and self.structured_output_manager.should_advance(
-                    request):
+                request
+            ):
                 # NOTE: structured_output_request
                 # should not be None if use_structured_output, we have
                 # checked above, so safe to ignore type warning
                 request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids)
+                    req_id, new_token_ids
+                )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None \
-                or kv_transfer_params:
-
+            if new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1819,7 +2018,8 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
-                    ))
+                    )
+                )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -1834,7 +2034,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: update state for finished KV Transfers.
         if model_runner_output.kv_connector_output:
             self._update_from_kv_xfer_finished(
-                model_runner_output.kv_connector_output)
+                model_runner_output.kv_connector_output
+            )
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -1853,11 +2054,13 @@ class Scheduler(SchedulerInterface):
                     eco.finished_requests = finished_set
                 else:
                     engine_core_outputs[client_index] = EngineCoreOutputs(
-                        finished_requests=finished_set)
+                        finished_requests=finished_set
+                    )
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats,
-                                     kv_connector_stats)) is not None:
+        if (
+            stats := self.make_stats(spec_decoding_stats, kv_connector_stats)
+        ) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request
@@ -1889,7 +2092,8 @@ class Scheduler(SchedulerInterface):
 
     def _free_encoder_inputs(self, request: Request) -> None:
         cached_encoder_input_ids = (
-            self.encoder_cache_manager.get_cached_input_ids(request))
+            self.encoder_cache_manager.get_cached_input_ids(request)
+        )
         # OPTIMIZATION: Avoid list(set) if the set is empty.
         if not cached_encoder_input_ids:
             return
@@ -1904,21 +2108,19 @@ class Scheduler(SchedulerInterface):
                 # With Whisper, as soon as we've generated a single token,
                 # we know we're done with the encoder input. Cross Attention
                 # KVs have been calculated and cached already.
-                self.encoder_cache_manager.free_encoder_input(
-                    request, input_id)
+                self.encoder_cache_manager.free_encoder_input(request, input_id)
             elif start_pos + num_tokens <= request.num_computed_tokens:
                 # The encoder output is already processed and stored
                 # in the decoder's KV cache.
-                self.encoder_cache_manager.free_encoder_input(
-                    request, input_id)
+                self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(
         self,
         draft_token_ids: DraftTokenIds,
     ) -> None:
         for req_id, spec_token_ids in zip(
-                draft_token_ids.req_ids,
-                draft_token_ids.draft_token_ids,
+            draft_token_ids.req_ids,
+            draft_token_ids.draft_token_ids,
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -1932,7 +2134,8 @@ class Scheduler(SchedulerInterface):
             elif self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
-                    spec_token_ids)
+                    spec_token_ids
+                )
             else:
                 request.spec_token_ids = spec_token_ids
 
@@ -1944,12 +2147,12 @@ class Scheduler(SchedulerInterface):
         # [NOTE, hyunnnchoi, 2025.12.01] ELIS initial prediction for ISRTF scheduling
         if self.elis_enabled:
             self._elis_initial_prediction(request)
-        
+
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
-        
+
         # [NOTE, hyunnnchoi, 2025.12.11] Track request queuing for HOL blocking analysis
         if self.hol_tracker is not None:
             self.hol_tracker.record_request_queued(
@@ -1968,7 +2171,7 @@ class Scheduler(SchedulerInterface):
         """
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
-            request_ids = (request_ids, )
+            request_ids = (request_ids,)
         else:
             request_ids = set(request_ids)
 
@@ -2002,54 +2205,43 @@ class Scheduler(SchedulerInterface):
 
     def _save_decode_timings(self, request: Request) -> None:
         """Save decode step timings to a JSON file for analysis.
-        
+
         NOTE(hyunnnchoi,2025-10-30): This saves detailed per-token timing
         information for debugging and performance analysis.
         """
         if not request.decode_step_timings:
             return
-        
+
         import json
         import os
         from datetime import datetime
-        
+
         # Get output directory from environment variable or use default
         # Set VLLM_DECODE_TIMINGS_DIR to match your benchmark log location
         output_dir = os.environ.get(
-            "VLLM_DECODE_TIMINGS_DIR", 
-            os.path.join(os.getcwd(), "decode_timings")
+            "VLLM_DECODE_TIMINGS_DIR",
+            os.path.join(os.getcwd(), "decode_timings"),
         )
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Convert arrival_time (Unix timestamp in seconds) to human-readable format
         arrival_time_unix = request.arrival_time
         arrival_time_str = datetime.fromtimestamp(arrival_time_unix).strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         )
-        
-        # NOTE, hyunnnchoi, 2025.12.23: Calculate accurate waiting and execution times
+
+        # NOTE(hyunnnchoi,2025-01-07): Calculate accurate waiting and execution times
+        # Waiting time = time from arrival to first schedule (both in monotonic clock)
         waiting_time_ms = None
         if request.first_scheduled_time is not None:
-            # arrival_time is in seconds (Unix timestamp), convert to monotonic time equivalent
-            # We use first_scheduled_time (monotonic) - arrival_time converted to monotonic scale
-            # Since we can't directly convert, we calculate from the first token timestamp
-            waiting_time_ms = (request.first_scheduled_time - 
-                             (request.arrival_time - time.time() + time.monotonic())) * 1000.0
-            # Simplified: use the time difference from arrival to first schedule
-            if request.first_token_timestamp:
-                # More accurate: waiting time is TTFT minus execution time
-                ttft_ms = request.first_token_timestamp - request.arrival_time * 1000.0
-                # Find execution time up to first token
-                first_token_exec_time = 0.0
-                for sched_time, duration in request.scheduled_iterations:
-                    if request.first_token_timestamp and sched_time * 1000.0 < request.first_token_timestamp:
-                        first_token_exec_time += duration
-                    else:
-                        break
-                waiting_time_ms = max(0.0, ttft_ms - first_token_exec_time)
-        
+            # Both times are in monotonic clock, so direct subtraction is accurate
+            waiting_time_ms = (
+                request.first_scheduled_time - request.arrival_time_monotonic
+            ) * 1000.0
+            waiting_time_ms = max(0.0, waiting_time_ms)  # Ensure non-negative
+
         execution_time_ms = request.total_execution_time_ms
-        
+
         # Prepare data
         timings_data = {
             "request_id": request.request_id,
@@ -2068,7 +2260,8 @@ class Scheduler(SchedulerInterface):
                     "token_id": token_id,
                     "timestamp_ms": timestamp_ms,
                     "output_token_index": token_idx,
-                    "time_since_arrival_ms": timestamp_ms - arrival_time_unix * 1000.0,
+                    "time_since_arrival_ms": timestamp_ms
+                    - arrival_time_unix * 1000.0,
                 }
                 for token_id, timestamp_ms, token_idx in request.decode_step_timings
             ],
@@ -2076,58 +2269,68 @@ class Scheduler(SchedulerInterface):
                 {
                     "iteration_index": i,
                     "start_time_monotonic": start_time,
-                    "duration_ms": duration_ms
+                    "duration_ms": duration_ms,
                 }
-                for i, (start_time, duration_ms) in enumerate(request.scheduled_iterations)
-            ]
+                for i, (start_time, duration_ms) in enumerate(
+                    request.scheduled_iterations
+                )
+            ],
         }
-        
+
         # Calculate statistics
         if len(request.decode_step_timings) > 1:
             timings = [t[1] for t in request.decode_step_timings]
             time_to_first_token_ms = (
                 request.first_token_timestamp - request.arrival_time * 1000.0
-                if request.first_token_timestamp else None
+                if request.first_token_timestamp
+                else None
             )
             inter_token_latencies = [
-                timings[i] - timings[i-1] 
-                for i in range(1, len(timings))
+                timings[i] - timings[i - 1] for i in range(1, len(timings))
             ]
-            
+
             total_time_ms = timings[-1] - arrival_time_unix * 1000.0
-            
+
             timings_data["statistics"] = {
                 "time_to_first_token_ms": time_to_first_token_ms,
                 "total_generation_time_ms": total_time_ms,
                 "waiting_time_ms": waiting_time_ms,
                 "execution_time_ms": execution_time_ms,
-                "execution_ratio": (execution_time_ms / total_time_ms * 100.0 
-                                   if total_time_ms > 0 else None),
+                "execution_ratio": (
+                    execution_time_ms / total_time_ms * 100.0
+                    if total_time_ms > 0
+                    else None
+                ),
                 "inter_token_latencies_ms": inter_token_latencies,
                 "avg_inter_token_latency_ms": (
                     sum(inter_token_latencies) / len(inter_token_latencies)
-                    if inter_token_latencies else None
+                    if inter_token_latencies
+                    else None
                 ),
                 "min_inter_token_latency_ms": (
-                    min(inter_token_latencies) if inter_token_latencies else None
+                    min(inter_token_latencies)
+                    if inter_token_latencies
+                    else None
                 ),
                 "max_inter_token_latency_ms": (
-                    max(inter_token_latencies) if inter_token_latencies else None
+                    max(inter_token_latencies)
+                    if inter_token_latencies
+                    else None
                 ),
                 "throughput_tokens_per_sec": (
                     len(request.output_token_ids) / (total_time_ms / 1000.0)
-                    if total_time_ms > 0 else None
+                    if total_time_ms > 0
+                    else None
                 ),
             }
-        
+
         # Save to file
         filename = os.path.join(
-            output_dir, 
-            f"decode_timing_{request.request_id}.json"
+            output_dir, f"decode_timing_{request.request_id}.json"
         )
         with open(filename, "w") as f:
             json.dump(timings_data, f, indent=2)
-        
+
         # NOTE, hyunnnchoi, 2025.12.23: Log waiting and execution times
         logger.info(
             f"Request {request.request_id} completed: "
@@ -2149,9 +2352,9 @@ class Scheduler(SchedulerInterface):
             self.isrtf_metrics_tracker.complete_request(
                 request_id=request.request_id,
                 completion_time=time.time(),
-                actual_output_tokens=request.num_output_tokens
+                actual_output_tokens=request.num_output_tokens,
             )
-        
+
         # [NOTE, hyunnnchoi, 2025.12.11] Track request completion for HOL blocking analysis
         if self.hol_tracker is not None:
             self.hol_tracker.record_request_finished(request.request_id)
@@ -2191,15 +2394,19 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
-        return SchedulerStats(num_running_reqs=len(self.running),
-                              num_waiting_reqs=len(self.waiting),
-                              kv_cache_usage=self.kv_cache_manager.usage,
-                              prefix_cache_stats=prefix_cache_stats,
-                              spec_decoding_stats=spec_decoding_stats,
-                              num_corrupted_reqs=sum(req.is_output_corrupted
-                                                     for req in self.running),
-                              kv_connector_stats=kv_connector_stats.data
-                              if kv_connector_stats else None)
+        return SchedulerStats(
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+            kv_cache_usage=self.kv_cache_manager.usage,
+            prefix_cache_stats=prefix_cache_stats,
+            spec_decoding_stats=spec_decoding_stats,
+            num_corrupted_reqs=sum(
+                req.is_output_corrupted for req in self.running
+            ),
+            kv_connector_stats=kv_connector_stats.data
+            if kv_connector_stats
+            else None,
+        )
 
     def make_spec_decoding_stats(
         self,
@@ -2213,7 +2420,8 @@ class Scheduler(SchedulerInterface):
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens,
-            num_accepted_tokens=num_accepted_tokens)
+            num_accepted_tokens=num_accepted_tokens,
+        )
         return spec_decoding_stats
 
     def shutdown(self) -> None:
@@ -2232,7 +2440,8 @@ class Scheduler(SchedulerInterface):
         return self.connector
 
     def _connector_finished(
-            self, request: Request) -> tuple[bool, Optional[dict[str, Any]]]:
+        self, request: Request
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
         """
         Invoke the KV connector request_finished() method if applicable.
 
@@ -2242,7 +2451,7 @@ class Scheduler(SchedulerInterface):
         if self.connector is None:
             return False, None
 
-        (block_ids, ) = self.kv_cache_manager.get_block_ids(request.request_id)
+        (block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
         return self.connector.request_finished(request, block_ids)
 
     def _update_waiting_for_remote_kv(self, request: Request) -> bool:
@@ -2262,7 +2471,7 @@ class Scheduler(SchedulerInterface):
             return False
 
         # Now that the blocks are ready, actually cache them.
-        (block_ids, ) = self.kv_cache_manager.get_block_ids(request.request_id)
+        (block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
         num_computed_tokens = len(block_ids) * self.block_size
         # Handle the case where num request tokens less than one block.
         num_computed_tokens = min(num_computed_tokens, request.num_tokens)
@@ -2278,8 +2487,9 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids.remove(request.request_id)
         return True
 
-    def _update_from_kv_xfer_finished(self,
-                                      kv_connector_output: KVConnectorOutput):
+    def _update_from_kv_xfer_finished(
+        self, kv_connector_output: KVConnectorOutput
+    ):
         """
         KV Connector: update the scheduler state based on the output.
 
@@ -2294,14 +2504,16 @@ class Scheduler(SchedulerInterface):
             self.connector.update_connector_output(kv_connector_output)
 
         # KV Connector:: update recv and send status from last step.
-        for req_id in (kv_connector_output.finished_recving or ()):
+        for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.add(req_id)
-        for req_id in (kv_connector_output.finished_sending or ()):
+        for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             if req_id not in self.requests:
                 logger.warning(
                     "Got finished sending KV transfer for request %s,"
-                    "but the request is already freed.", req_id)
+                    "but the request is already freed.",
+                    req_id,
+                )
             else:
                 self._free_blocks(self.requests[req_id])
